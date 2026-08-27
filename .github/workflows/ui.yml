@@ -1,0 +1,63 @@
+name: UI bundle provenance
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ui/**'
+      - 'rust/assets/static/react/**'
+      - 'rust/assets/static/ui-bundle-provenance.json'
+      - 'rust/crates/stax-server/build.rs'
+      - 'rust/crates/stax-server/src/assets.rs'
+      - 'rust/ui-bundle-differ.sh'
+      - '.github/workflows/ui.yml'
+  pull_request:
+    paths:
+      - 'ui/**'
+      - 'rust/assets/static/react/**'
+      - 'rust/assets/static/ui-bundle-provenance.json'
+      - 'rust/crates/stax-server/build.rs'
+      - 'rust/crates/stax-server/src/assets.rs'
+      - 'rust/ui-bundle-differ.sh'
+      - '.github/workflows/ui.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  ui-bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22.18.0'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install locked UI dependencies
+        run: npm ci
+        working-directory: ui
+      - name: Typecheck UI
+        run: npm run typecheck
+        working-directory: ui
+      - name: Test all Node services
+        run: node --test tests/services/*.test.ts
+        working-directory: ui
+      - name: Build committed dashboard bundle
+        run: npm run build
+        working-directory: ui
+      - name: Check direct-build byte parity
+        run: |
+          test -f rust/assets/static/ui-bundle-provenance.json
+          git diff --exit-code -- rust/assets/static/react
+      - name: Rebuild and verify provenance in a clean checkout
+        run: ./rust/ui-bundle-differ.sh
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Test embedded asset contract
+        run: cargo test --locked -p stax-server assets::tests
+        working-directory: rust

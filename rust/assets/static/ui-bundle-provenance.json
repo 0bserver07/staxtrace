@@ -1,0 +1,11 @@
+{
+  "schema": "staxtrace.ui-bundle-provenance/1",
+  "hash_algorithm": "sha256-length-prefixed-path-and-bytes",
+  "source_tree_sha256": "77433e3dabfcff513d523e4b209858f927e180ae0723590ba24742c9526091da",
+  "lockfile_sha256": "97cd25380e18fb2b346c2ded4c4c24fdd503963d3239b0db3839778e8b065b54",
+  "generated_output_tree_sha256": "7cc8b11e7766c2ad8058d65e33366443986608abf478c16e51509e83008194b6",
+  "toolchain": {
+    "node": "22.18.0",
+    "npm": "10.9.3"
+  }
+}
