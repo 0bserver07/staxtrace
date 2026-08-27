@@ -1,0 +1,9 @@
+{
+  "schema": "staxtrace.performance-scenario",
+  "scenario": "fixture_extension",
+  "fixture": {"rows": 10},
+  "samples": 3,
+  "guard": {"metric": "p99_ms", "comparison": "at_most", "limit": 100.0},
+  "test": {"package": "stax-etl", "integration_test": "perf_extension", "test_name": "fixture_extension_distribution"},
+  "resources": {"mode": "edge", "minimum_rss_samples": 2, "minimum_open_file_samples": 2, "child_process_samples": 0}
+}

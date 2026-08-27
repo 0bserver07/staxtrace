@@ -1,62 +1,207 @@
-//! DIV-349 — the perf gates that let Python's perf-budget tests retire.
+//! Release-only performance evidence for the HTTP query and installed hook.
 //!
-//! Four gates, mirrored one-for-one from the reference suite's load-sensitive
-//! budget tests (same seeds, same warm-then-time shape, same thresholds):
-//!
-//! | gate | reference | budget |
-//! |---|---|---|
-//! | cost by-provider, 100K mart rows | `test_cost_uses_mart.py:354` | 100 ms |
-//! | dashboard-data, 100K mart rows | `test_dashboard_data_uses_mart.py:329` | 100 ms |
-//! | messages summary, 50K totals | `test_messages_summary_uses_mart.py:369` | 1500 ms |
-//! | hook fire p99, end-to-end | `test_handlers.py:385` | 50 ms |
-//!
-//! Timing asserts are meaningless in a debug build, so every gate self-skips
-//! under `debug_assertions`; `rust/perf-gate.sh` runs the suite `--release`,
-//! which is the configuration the numbers are contractual in. The hook gate
-//! spawns the sibling release `stax` binary — the real deployment shape, the
-//! same one the settings.json hooks exec.
-//!
-//! Route timings are BEST-OF-FIVE: the minimum is the least load-contaminated
-//! observation of the code's cost, which is what a budget is about — the
-//! single-shot originals flaked whenever the machine breathed, and inheriting
-//! that flake was the one part of the reference worth leaving behind.
+//! Ordinary workspace tests see these scenarios as ignored. The bounded
+//! runner in `rust/perf-gate.sh` opts into them, records distributional latency
+//! and resource evidence, and validates their fixed fixture cardinality.
 
-use std::path::PathBuf;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::Request as HttpRequest;
 use rusqlite::Connection;
-use stax_server::state::{AppState, Config};
+use serde_json::{Value, json};
+use stax_server::state::{AppState, Config, CurrentProject};
 use tower::ServiceExt as _;
 
-fn scratch(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("stax-perf-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+#[path = "../../../perf/support.rs"]
+mod perf;
+
+const QUERY_MESSAGES: i64 = 100_000;
+const QUERY_SESSIONS: i64 = 1_000;
+const QUERY_PROJECTS: i64 = 20;
+const QUERY_SAMPLES: usize = 100;
+const HOOK_SAMPLES: usize = 200;
+const QUERY_SLUG: &str = "performance-query";
+
+static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        let sequence = SCRATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "stax-performance-{tag}-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create performance scratch directory");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
 }
 
-fn fresh_store(dir: &std::path::Path) -> Connection {
-    let path = dir.join("store.db");
-    let conn = Connection::open(&path).expect("open");
-    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = OFF;")
-        .expect("pragmas");
-    stax_core::schema::apply(&conn).expect("schema");
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn fresh_store(dir: &Path) -> Connection {
+    let conn = stax_etl::ingest::guard::open_read_write(&dir.join("store.db"))
+        .expect("open performance store through production connection path");
+    stax_core::schema::apply(&conn).expect("apply production schema");
+    let journal: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("read query fixture journal mode");
+    let synchronous: i64 = conn
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .expect("read query fixture durability");
+    let foreign_keys: i64 = conn
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .expect("read query fixture foreign-key mode");
+    assert_eq!((journal.as_str(), synchronous, foreign_keys), ("wal", 1, 1));
     conn
 }
 
-fn state_for(dir: &std::path::Path) -> AppState {
-    AppState::new(
+fn seed_query_store(dir: &Path) {
+    let conn = fresh_store(dir);
+    let partition = stax_etl::ingest::writer::partition_for("2026-01-01T00:00:00Z");
+    assert_eq!(partition, "messages_202601");
+    stax_etl::ingest::writer::ensure_partition(&conn, &partition)
+        .expect("create production query message partition");
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .expect("begin fixture");
+    {
+        let mut project = conn
+            .prepare(
+                "INSERT INTO projects \
+                 (id, provider, slug, path, display_name, first_seen, last_modified) \
+                 VALUES (?, ?, ?, NULL, ?, 0, 0)",
+            )
+            .expect("prepare projects");
+        for index in 0..QUERY_PROJECTS {
+            project
+                .execute(rusqlite::params![
+                    index + 1,
+                    format!("fixture-source-{index}"),
+                    QUERY_SLUG,
+                    format!("Fixture {index}")
+                ])
+                .expect("insert project");
+        }
+    }
+    {
+        let mut session = conn
+            .prepare(
+                "INSERT INTO sessions \
+                 (id, project_id, session_id, first_ts, last_ts, message_count) \
+                 VALUES (?, ?, ?, '2026-01-01T00:00:00Z', \
+                         '2026-01-01T00:01:39Z', 100)",
+            )
+            .expect("prepare sessions");
+        for index in 0..QUERY_SESSIONS {
+            session
+                .execute(rusqlite::params![
+                    index + 1,
+                    (index % QUERY_PROJECTS) + 1,
+                    format!("fixture-session-{index}")
+                ])
+                .expect("insert session");
+        }
+    }
+    {
+        let insert = format!(
+            "INSERT INTO {partition} \
+                 (id, session_fk, seq, timestamp, role, model, input_tokens, \
+                  output_tokens, cache_create_tokens, cache_read_tokens, \
+                  content_text, tools_json, raw_json, is_sidechain, uuid, \
+                         parent_uuid, speed) \
+                 VALUES (?, ?, ?, '2026-01-01T00:00:00Z', 'assistant', \
+                         'fixture-model', 1, 1, 0, 0, 'trace fixture', '[]', \
+                         '{{}}', 0, ?, NULL, 'standard')"
+        );
+        let mut message = conn.prepare(&insert).expect("prepare messages");
+        for index in 0..QUERY_MESSAGES {
+            let session_fk = (index % QUERY_SESSIONS) + 1;
+            let seq = index / QUERY_SESSIONS;
+            message
+                .execute(rusqlite::params![
+                    index + 1,
+                    session_fk,
+                    seq,
+                    format!("fixture-message-{index}")
+                ])
+                .expect("insert message");
+        }
+    }
+    conn.execute(
+        "UPDATE _messages_id_seq SET next_id = ? WHERE rowid_kind = 1",
+        [QUERY_MESSAGES + 1],
+    )
+    .expect("advance message sequence");
+    conn.execute_batch("COMMIT").expect("commit fixture");
+
+    let messages: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+        .expect("count messages");
+    let sessions: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .expect("count sessions");
+    let projects: i64 = conn
+        .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+        .expect("count projects");
+    let partition_messages: i64 = conn
+        .query_row(&format!("SELECT COUNT(*) FROM {partition}"), [], |row| {
+            row.get(0)
+        })
+        .expect("count production-partition messages");
+    let unknown_messages: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messages_unknown", [], |row| {
+            row.get(0)
+        })
+        .expect("count unknown-partition messages");
+    perf::assert_exact(
+        "query messages after deduplication",
+        messages as u64,
+        QUERY_MESSAGES as u64,
+    );
+    perf::assert_exact("query sessions", sessions as u64, QUERY_SESSIONS as u64);
+    perf::assert_exact("query projects", projects as u64, QUERY_PROJECTS as u64);
+    perf::assert_exact(
+        "query dated partition messages",
+        partition_messages as u64,
+        QUERY_MESSAGES as u64,
+    );
+    perf::assert_exact(
+        "query unknown partition messages",
+        unknown_messages as u64,
+        0,
+    );
+}
+
+fn query_app(dir: &Path) -> Router {
+    let state = AppState::new(
         dir.join("store.db"),
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets"),
         Config::default(),
-    )
+    );
+    state.set_current_project(CurrentProject {
+        project_path: Some(QUERY_SLUG.to_owned()),
+        log_path: Some(dir.join(QUERY_SLUG).to_string_lossy().into_owned()),
+    });
+    stax_server::app(state)
 }
 
-async fn get(state: &AppState, target: &str) -> (u16, String) {
-    let app = stax_server::app(state.clone());
+async fn get(app: &Router, target: &str) -> (u16, Value) {
     let response = app
+        .clone()
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
@@ -67,233 +212,293 @@ async fn get(state: &AppState, target: &str) -> (u16, String) {
         .await
         .expect("response");
     let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), 1 << 24)
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
         .await
         .expect("body");
-    (status, String::from_utf8_lossy(&bytes).into_owned())
+    let body = serde_json::from_slice(&bytes).expect("JSON body");
+    (status, body)
 }
 
-fn debug_skip(gate: &str) -> bool {
-    if cfg!(debug_assertions) {
-        eprintln!("SKIP {gate} — perf gates are contractual in --release only");
-        return true;
-    }
-    false
-}
-
-/// `test_cost_by_provider_under_100ms_with_100k_mart_rows`, seed for seed.
-#[tokio::test]
-async fn cost_by_provider_under_100ms_with_100k_mart_rows() {
-    if debug_skip("cost gate") {
-        return;
-    }
-    let dir = scratch("cost");
-    let conn = fresh_store(&dir);
-    {
-        let mut stmt = conn
-            .prepare(
-                "INSERT OR IGNORE INTO provider_day_mart \
-                 (day, provider, cost_usd, message_count, session_count, project_count) \
-                 VALUES (?, ?, 0.01, 1, 1, 1)",
-            )
-            .expect("prepare");
-        conn.execute_batch("BEGIN").unwrap();
-        for d in 0..1000i64 {
-            let day = format!(
-                "20{:02}-{:02}-{:02}",
-                ((d / 365) + 24) % 100,
-                ((d % 365 / 30) % 12) + 1,
-                (d % 28) + 1
-            );
-            for p in 0..100 {
-                stmt.execute(rusqlite::params![day, format!("provider-{p}")])
-                    .expect("insert");
-            }
-        }
-        conn.execute_batch("COMMIT").unwrap();
-    }
-    drop(conn);
-    let state = state_for(&dir);
-    let (status, _) = get(&state, "/api/cost-data/by-provider?period=all").await;
-    assert_eq!(status, 200, "warm call");
-    let mut best = f64::MAX;
-    let mut last = (0u16, String::new());
-    for _ in 0..5 {
-        let t0 = Instant::now();
-        last = get(&state, "/api/cost-data/by-provider?period=all").await;
-        best = best.min(t0.elapsed().as_secs_f64() * 1000.0);
-    }
-    assert_eq!(last.0, 200);
-    assert!(last.1.contains("provider-"), "rows came back");
-    assert!(best < 100.0, "slow: {best:.1}ms best-of-5 (budget 100)");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// `test_dashboard_data_under_100ms_with_100k_mart_rows` — 1000 days × 100
-/// models of `daily_mart` plus the project + mart row the route reads.
-#[tokio::test]
-async fn dashboard_data_under_100ms_with_100k_mart_rows() {
-    if debug_skip("dashboard gate") {
-        return;
-    }
-    let dir = scratch("dash");
-    let conn = fresh_store(&dir);
-    conn.execute(
-        "INSERT INTO projects (provider, slug, display_name, first_seen, last_modified) VALUES ('claude', '-perf-dash', 'perf', 0, 0)",
-        [],
-    )
-    .expect("project");
-    let pid: i64 = conn
-        .query_row(
-            "SELECT id FROM projects WHERE slug = '-perf-dash'",
-            [],
-            |r| r.get(0),
-        )
-        .expect("pid");
-    conn.execute(
-        "INSERT INTO project_mart (project_id, provider, slug, display_name, total_messages, \
-         total_input_tokens, total_cost_usd) VALUES (?, 'claude', '-perf-dash', 'perf', 100000, 10000000, 42.0)",
-        [pid],
-    )
-    .expect("mart");
-    {
-        let mut stmt = conn
-            .prepare(
-                "INSERT OR IGNORE INTO daily_mart \
-                 (day, project_id, provider, model, speed, input_tokens, output_tokens, \
-                  cache_read, cache_create, message_count, session_count, cost_usd) \
-                 VALUES (?, ?, 'claude', ?, 'standard', 10, 5, 0, 0, 1, 1, 0.001)",
-            )
-            .expect("prepare");
-        conn.execute_batch("BEGIN").unwrap();
-        for d in 0..1000i64 {
-            let day = format!("2024-{:02}-{:02}", ((d / 30) % 12) + 1, (d % 28) + 1);
-            for m in 0..100 {
-                stmt.execute(rusqlite::params![day, pid, format!("model-{m}")])
-                    .expect("insert");
-            }
-        }
-        conn.execute_batch("COMMIT").unwrap();
-    }
-    drop(conn);
-    let state = state_for(&dir);
-    state.set_current_project(stax_server::state::CurrentProject {
-        project_path: Some("-perf-dash".to_owned()),
-        log_path: Some("/fake/-perf-dash".to_owned()),
-    });
-    let (status, _) = get(&state, "/api/dashboard-data").await;
-    assert_eq!(status, 200, "warm call");
-    let mut best = f64::MAX;
-    let mut last = (0u16, String::new());
-    for _ in 0..5 {
-        let t0 = Instant::now();
-        last = get(&state, "/api/dashboard-data").await;
-        best = best.min(t0.elapsed().as_secs_f64() * 1000.0);
-    }
-    assert_eq!(last.0, 200);
-    assert!(last.1.contains("42"), "total cost visible");
-    assert!(best < 100.0, "slow: {best:.1}ms best-of-5 (budget 100)");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// `test_messages_summary_under_budget` — 50K totals through `project_mart`.
-#[tokio::test]
-async fn messages_summary_under_1500ms_with_50k_totals() {
-    if debug_skip("summary gate") {
-        return;
-    }
-    let dir = scratch("summary");
-    let conn = fresh_store(&dir);
-    conn.execute(
-        "INSERT INTO projects (provider, slug, display_name, first_seen, last_modified) VALUES ('claude', '-perf-summary', 'perf', 0, 0)",
-        [],
-    )
-    .expect("project");
-    let pid: i64 = conn
-        .query_row(
-            "SELECT id FROM projects WHERE slug = '-perf-summary'",
-            [],
-            |r| r.get(0),
-        )
-        .expect("pid");
-    conn.execute(
-        "INSERT INTO sessions (project_id, session_id, first_ts, last_ts, message_count) \
-         VALUES (?, 's1', '2026-04-01T10:00:00Z', '2026-04-01T10:00:00Z', 50000)",
-        [pid],
-    )
-    .expect("session");
-    conn.execute(
-        "INSERT INTO project_mart (project_id, provider, slug, display_name, total_messages, total_sessions, \
-         total_records, total_user_messages, total_assistant_messages) \
-         VALUES (?, 'claude', '-perf-summary', 'perf', 50000, 1, 50000, 20000, 30000)",
-        [pid],
-    )
-    .expect("mart");
-    drop(conn);
-    let state = state_for(&dir);
-    state.set_current_project(stax_server::state::CurrentProject {
-        project_path: Some("-perf-summary".to_owned()),
-        log_path: Some("/fake/-perf-summary".to_owned()),
-    });
-    let (status, _) = get(&state, "/api/messages/summary").await;
-    assert_eq!(status, 200, "warm call");
-    let mut best = f64::MAX;
-    let mut last = (0u16, String::new());
-    for _ in 0..5 {
-        let t0 = Instant::now();
-        last = get(&state, "/api/messages/summary").await;
-        best = best.min(t0.elapsed().as_secs_f64() * 1000.0);
-    }
-    assert_eq!(last.0, 200);
-    assert!(
-        last.1.contains("50000") || last.1.contains("50,000"),
-        "total visible: {}",
-        last.1
+fn assert_query_response(response: &(u16, Value)) {
+    assert_eq!(response.0, 200);
+    assert_eq!(
+        response.1.get("total").and_then(Value::as_u64),
+        Some(QUERY_MESSAGES as u64),
+        "query must cover the complete post-deduplication fixture"
     );
-    assert!(best < 1500.0, "slow: {best:.1}ms best-of-5 (budget 1500)");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `test_handler_p99_under_50ms` — 100 end-to-end fires of the sibling
-/// release binary, the exact shape settings.json execs.
-#[test]
-fn hook_fire_p99_under_50ms() {
-    if debug_skip("hook gate") {
-        return;
+#[tokio::test]
+#[ignore = "release-only performance evidence; run rust/perf-gate.sh"]
+async fn cold_and_warm_query_distributions() {
+    let fixture = &[
+        ("messages", QUERY_MESSAGES as u64),
+        ("sessions", QUERY_SESSIONS as u64),
+        ("projects", QUERY_PROJECTS as u64),
+    ];
+    let cold_guard = perf::Guard::MaxP99Ms(1_500.0);
+    let warm_guard = perf::Guard::MaxP99Ms(250.0);
+    perf::prepare_scenario("query_cold", fixture, Some(QUERY_SAMPLES), cold_guard);
+    perf::prepare_scenario("query_warm", fixture, Some(QUERY_SAMPLES), warm_guard);
+
+    let cold_monitor = perf::ResourceMonitor::start();
+    let setup_started = Instant::now();
+    let scratch = Scratch::new("query");
+    seed_query_store(scratch.path());
+    let shared_setup_wall = setup_started.elapsed();
+    let mut cold = Vec::with_capacity(QUERY_SAMPLES);
+    let mut last = None;
+    for _ in 0..QUERY_SAMPLES {
+        let started = Instant::now();
+        last = Some(get(&query_app(scratch.path()), "/api/messages?per_page=1").await);
+        cold.push(perf::elapsed_ms(started));
     }
-    let stax = std::env::current_exe()
+    let cold_resources = cold_monitor.stop();
+    assert_query_response(last.as_ref().expect("cold response"));
+    perf::assert_exact(
+        "cold query samples",
+        cold.len() as u64,
+        QUERY_SAMPLES as u64,
+    );
+    perf::write_receipt(
+        "query_cold",
+        fixture,
+        Some(QUERY_SAMPLES),
+        &cold,
+        perf::Timing::explicit(
+            shared_setup_wall,
+            Duration::ZERO,
+            perf::sum_sample_time(&cold),
+        ),
+        None,
+        cold_resources,
+        cold_guard,
+    );
+
+    let warm_setup_started = Instant::now();
+    let warm_monitor = perf::ResourceMonitor::start();
+    let warm_app = query_app(scratch.path());
+    assert_query_response(&get(&warm_app, "/api/messages?per_page=1").await);
+    let warm_setup_wall = shared_setup_wall.saturating_add(warm_setup_started.elapsed());
+    let mut warm = Vec::with_capacity(QUERY_SAMPLES);
+    let mut last = None;
+    for _ in 0..QUERY_SAMPLES {
+        let started = Instant::now();
+        last = Some(get(&warm_app, "/api/messages?per_page=1").await);
+        warm.push(perf::elapsed_ms(started));
+    }
+    let warm_resources = warm_monitor.stop();
+    assert_query_response(last.as_ref().expect("warm response"));
+    perf::assert_exact(
+        "warm query samples",
+        warm.len() as u64,
+        QUERY_SAMPLES as u64,
+    );
+    perf::write_receipt(
+        "query_warm",
+        fixture,
+        Some(QUERY_SAMPLES),
+        &warm,
+        perf::Timing::explicit(
+            warm_setup_wall,
+            Duration::ZERO,
+            perf::sum_sample_time(&warm),
+        ),
+        None,
+        warm_resources,
+        warm_guard,
+    );
+}
+
+fn release_hook_binary() -> PathBuf {
+    let executable = format!("stax-hooks{}", std::env::consts::EXE_SUFFIX);
+    std::env::current_exe()
         .ok()
         .and_then(|exe| {
             exe.ancestors()
-                .find(|dir| dir.join("stax").is_file())
-                .map(|dir| dir.join("stax"))
+                .find(|dir| dir.join(&executable).is_file())
+                .map(|dir| dir.join(&executable))
         })
-        .expect("release stax next to the test binary");
-    let payload = r#"{"session_id":"perf-gate","cwd":"/tmp","hook_event_name":"UserPromptSubmit","prompt":"x"}"#;
-    let mut samples: Vec<f64> = Vec::with_capacity(100);
-    for _ in 0..100 {
-        let t0 = Instant::now();
-        let mut child = std::process::Command::new(&stax)
-            .args(["hooks", "run", "stackunderflow-user-prompt"])
+        .expect("release installed hook executable next to the performance test")
+}
+
+#[test]
+#[ignore = "release-only performance evidence; run rust/perf-gate.sh"]
+fn installed_hook_execution_distribution() {
+    let fixture = &[
+        ("hook_invocations", HOOK_SAMPLES as u64),
+        ("recorded_events", HOOK_SAMPLES as u64),
+    ];
+    let guard = perf::Guard::MaxP99Ms(50.0);
+    perf::prepare_scenario("hook_execution", fixture, Some(HOOK_SAMPLES), guard);
+    let scenario_started = Instant::now();
+    let monitor = perf::ResourceMonitor::start();
+    let scratch = Scratch::new("hook");
+    let hook = release_hook_binary();
+
+    let mut child_resources = perf::Resources::default();
+    let mut samples = Vec::with_capacity(HOOK_SAMPLES);
+    for invocation in 0..HOOK_SAMPLES {
+        let payload = json!({
+            "session_id": format!("performance-fixture-{invocation}"),
+            "cwd": "",
+            "hook_event_name": "Stop",
+        })
+        .to_string();
+        let started = Instant::now();
+        let mut child = std::process::Command::new(&hook)
+            .args(["run", "staxtrace-stop"])
+            .env("STAXTRACE_HOME", scratch.path())
+            .env("PROACTIVE_DISABLED", "1")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("spawn");
+            .expect("spawn installed hook command");
+        let child_monitor = perf::ChildProcessMonitor::start(child.id());
         {
             use std::io::Write as _;
             child
                 .stdin
                 .take()
-                .expect("stdin")
+                .expect("hook stdin")
                 .write_all(payload.as_bytes())
-                .expect("payload");
+                .expect("write hook payload");
         }
-        let status = child.wait().expect("wait");
-        samples.push(t0.elapsed().as_secs_f64() * 1000.0);
-        assert!(status.success(), "hook exit 0 — the never-block contract");
+        child_monitor.begin_processing();
+        let status = child.wait().expect("wait for installed hook");
+        samples.push(perf::elapsed_ms(started));
+        let child_sample = child_monitor.stop();
+        perf::assert_exact(
+            "post-input hook child observations",
+            child_sample.child_process_sample_count,
+            1,
+        );
+        child_resources = child_resources.merge(child_sample);
+        assert!(
+            status.success(),
+            "installed hook keeps the never-block exit contract"
+        );
     }
-    samples.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
-    let p99 = samples[(samples.len() as f64 * 0.99) as usize - 1];
-    assert!(p99 < 50.0, "hook p99 {p99:.2}ms exceeds the 50ms budget");
+    let resources = monitor.stop().merge(child_resources);
+    perf::assert_exact("hook samples", samples.len() as u64, HOOK_SAMPLES as u64);
+    perf::assert_exact(
+        "observed hook child invocations",
+        resources.child_process_sample_count,
+        HOOK_SAMPLES as u64,
+    );
+    let conn = Connection::open(scratch.path().join("store.db")).expect("open hook evidence store");
+    perf::assert_exact(
+        "durable hook events",
+        count_table(&conn, "captured_events"),
+        HOOK_SAMPLES as u64,
+    );
+    let timed_wall = perf::sum_sample_time(&samples);
+    perf::write_receipt(
+        "hook_execution",
+        fixture,
+        Some(HOOK_SAMPLES),
+        &samples,
+        perf::Timing::from_started(scenario_started, timed_wall, Duration::ZERO),
+        None,
+        resources,
+        guard,
+    );
+}
+
+#[test]
+fn child_monitor_observes_fast_post_input_roots_before_reaping() {
+    use std::io::Write as _;
+
+    let workload = r#"import sys
+sys.stdin.buffer.read()
+sum(index * index for index in range(125000))
+"#;
+    for invocation in 0..32 {
+        let mut child = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(workload)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn fast post-input root");
+        let monitor = perf::ChildProcessMonitor::start(child.id());
+        {
+            child
+                .stdin
+                .take()
+                .expect("fast-root stdin")
+                .write_all(format!("begin-{invocation}").as_bytes())
+                .expect("release fast root");
+        }
+        monitor.begin_processing();
+        assert!(child.wait().expect("wait fast root").success());
+        assert!(
+            child
+                .try_wait()
+                .expect("confirm fast root reaped")
+                .is_some(),
+            "fast root remains unreaped"
+        );
+        let resources = monitor.stop();
+        assert_eq!(resources.child_process_sample_count, 1);
+        assert!(resources.child_peak_rss_bytes > 0);
+        assert!(resources.child_peak_open_files > 0);
+    }
+}
+
+fn count_table(conn: &Connection, table: &str) -> u64 {
+    let count: i64 = conn
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap_or_else(|error| panic!("count {table}: {error}"));
+    u64::try_from(count).expect("non-negative table count")
+}
+
+#[test]
+fn child_monitor_observes_allocation_after_input_in_a_descendant() {
+    use std::io::Write as _;
+
+    let scratch = Scratch::new("child-monitor");
+    let held_file = scratch.path().join("held-open");
+    std::fs::write(&held_file, b"fixture").expect("write delayed-child fixture");
+    let descendant = r#"import sys,time
+held=[open(sys.argv[1], 'rb') for _ in range(64)]
+memory=bytearray(64 * 1024 * 1024)
+memory[::4096]=b'x' * (len(memory) // 4096)
+time.sleep(0.4)
+assert held and memory
+"#;
+    let supervisor = r#"import subprocess,sys
+sys.stdin.buffer.read()
+child=subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]])
+raise SystemExit(child.wait())
+"#;
+    let mut child = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(supervisor)
+        .arg(descendant)
+        .arg(&held_file)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn delayed-child supervisor");
+    let monitor = perf::ChildProcessMonitor::start(child.id());
+    child
+        .stdin
+        .take()
+        .expect("delayed-child stdin")
+        .write_all(b"begin")
+        .expect("release delayed child");
+    monitor.begin_processing();
+    assert!(child.wait().expect("wait delayed child").success());
+    let resources = monitor.stop();
+    assert_eq!(resources.child_process_sample_count, 1);
+    assert!(resources.child_peak_rss_bytes >= 48 * 1024 * 1024);
+    assert!(resources.child_peak_open_files >= 64);
+    assert!(resources.rss_sample_count > 0);
+    assert!(resources.open_file_sample_count > 0);
 }

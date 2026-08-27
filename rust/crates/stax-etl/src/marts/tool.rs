@@ -23,22 +23,44 @@
 //!
 //! `COUNT(DISTINCT session_id)` is not additive across windows, and it cannot
 //! be reconstructed from the window alone — a session that used the tool in an
-//! earlier window would be invisible. So the recompute scans every event of
-//! each touched `(day, project_id, provider)` triple, re-parsing `tools_json`.
-//! Python documents this as option (d), chosen over a presence table; the cost
-//! is `O(groups touched × events-per-day-of-those-groups)` and `len(keys)` does
-//! not bound it.
+//! earlier window would be invisible. The recompute therefore still scans the
+//! complete event history of every touched `(day, project_id, provider)`
+//! triple and re-parses `tools_json`, but it loads bounded groups together so
+//! the partitioned message view is materialized once per chunk rather than
+//! once per group. This preserves Python's documented option (d) without its
+//! repeated-query multiplier.
 
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, params_from_iter, types::Value as SqlValue};
 use serde_json::Value;
 
 use super::{MartBuilder, max_event_id};
 
 /// Per-`(day, project, provider, tool_name)` cost + token rollup.
 pub struct ToolMartBuilder;
+
+/// Three scalar binds per affected `(day, project, provider)` key, capped at
+/// the task's conservative 400-variable ceiling.
+const MAX_BATCH_BINDS: usize = 400;
+const TOOL_GROUP_CHUNK: usize = MAX_BATCH_BINDS / 3;
+const _: () = assert!(TOOL_GROUP_CHUNK * 3 <= MAX_BATCH_BINDS);
+
+#[derive(Default)]
+struct SourceScanAccounting {
+    #[cfg(test)]
+    queries: usize,
+}
+
+impl SourceScanAccounting {
+    fn record_query(&mut self) {
+        #[cfg(test)]
+        {
+            self.queries += 1;
+        }
+    }
+}
 
 /// The additive measures accumulated per bucket.
 #[derive(Default, Clone, Copy)]
@@ -262,6 +284,34 @@ pub fn parse_tool_names(tools_json: Option<&str>) -> Vec<(String, i64)> {
 /// Keys are deduped to their `(day, project_id, provider)` groups first, so the
 /// per-group `tools_json` reparse happens once rather than once per tool name.
 fn recompute_session_counts(conn: &Connection, keys: &[Key]) -> Result<()> {
+    let mut accounting = SourceScanAccounting::default();
+    recompute_session_counts_with_accounting(conn, keys, &mut accounting)
+}
+
+fn tool_group_batch_sql(group_count: usize) -> String {
+    debug_assert!(group_count > 0 && group_count <= TOOL_GROUP_CHUNK);
+    let values = (0..group_count)
+        .map(|ordinal| format!("({ordinal}, ?, ?, ?)"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "WITH affected(ordinal, day, project_id, provider) AS MATERIALIZED (VALUES {values}) \
+         SELECT affected.ordinal, e.session_id, m.tools_json \
+         FROM affected \
+         JOIN usage_events e \
+           ON e.day = affected.day \
+          AND e.project_id = affected.project_id \
+          AND e.provider = affected.provider \
+         LEFT JOIN messages m ON m.id = e.source_message_fk \
+         ORDER BY affected.ordinal, e.id"
+    )
+}
+
+fn recompute_session_counts_with_accounting(
+    conn: &Connection,
+    keys: &[Key],
+    accounting: &mut SourceScanAccounting,
+) -> Result<()> {
     let mut group_order: Vec<(String, i64, String)> = Vec::new();
     let mut group_tools: HashMap<(String, i64, String), HashSet<String>> = HashMap::new();
     for k in keys {
@@ -274,14 +324,6 @@ fn recompute_session_counts(conn: &Connection, keys: &[Key]) -> Result<()> {
         }
     }
 
-    let mut scan = conn.prepare(
-        r"
-        SELECT e.session_id, m.tools_json
-          FROM usage_events e
-          LEFT JOIN messages m ON m.id = e.source_message_fk
-         WHERE e.day = ? AND e.project_id = ? AND e.provider = ?
-        ",
-    )?;
     let mut update = conn.prepare(
         r"
         UPDATE tool_mart
@@ -291,41 +333,60 @@ fn recompute_session_counts(conn: &Connection, keys: &[Key]) -> Result<()> {
         ",
     )?;
 
-    for g in &group_order {
-        let wanted = &group_tools[g];
-        let rows: Vec<(String, Option<String>)> = scan
-            .query_map(rusqlite::params![g.0, g.1, g.2], |r| {
+    for chunk in group_order.chunks(TOOL_GROUP_CHUNK) {
+        let sql = tool_group_batch_sql(chunk.len());
+        let mut params = Vec::with_capacity(chunk.len() * 3);
+        for (day, project_id, provider) in chunk {
+            params.push(SqlValue::Text(day.clone()));
+            params.push(SqlValue::Integer(*project_id));
+            params.push(SqlValue::Text(provider.clone()));
+        }
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_from_iter(params.iter()), |row| {
                 Ok((
+                    row.get::<_, i64>(0)?,
                     // `str(row["session_id"] or "")`
-                    r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                    r.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(2)?,
                 ))
             })?
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        accounting.record_query();
 
-        let mut per_tool_order: Vec<String> = Vec::new();
-        let mut per_tool_sessions: HashMap<String, HashSet<String>> = HashMap::new();
-        for (sid, tools_json) in rows {
-            let tools = parse_tool_names(tools_json.as_deref());
-            if tools.is_empty() {
-                continue;
-            }
-            for (t, _) in tools {
-                if wanted.contains(&t) {
-                    if let Some(set) = per_tool_sessions.get_mut(&t) {
-                        set.insert(sid.clone());
-                    } else {
-                        per_tool_order.push(t.clone());
-                        per_tool_sessions.insert(t, HashSet::from([sid.clone()]));
+        let mut rows_by_group: Vec<Vec<(String, Option<String>)>> =
+            (0..chunk.len()).map(|_| Vec::new()).collect();
+        for (ordinal, session_id, tools_json) in rows {
+            rows_by_group[usize::try_from(ordinal)?].push((session_id, tools_json));
+        }
+
+        for (g, rows) in chunk.iter().zip(rows_by_group) {
+            let wanted = &group_tools[g];
+            let mut per_tool_order: Vec<String> = Vec::new();
+            let mut per_tool_sessions: HashMap<String, HashSet<String>> = HashMap::new();
+            for (sid, tools_json) in rows {
+                let tools = parse_tool_names(tools_json.as_deref());
+                if tools.is_empty() {
+                    continue;
+                }
+                for (t, _) in tools {
+                    if wanted.contains(&t) {
+                        if let Some(set) = per_tool_sessions.get_mut(&t) {
+                            set.insert(sid.clone());
+                        } else {
+                            per_tool_order.push(t.clone());
+                            per_tool_sessions.insert(t, HashSet::from([sid.clone()]));
+                        }
                     }
                 }
             }
-        }
 
-        for t in &per_tool_order {
-            #[allow(clippy::cast_possible_wrap)]
-            let n = per_tool_sessions[t].len() as i64;
-            update.execute(rusqlite::params![n, g.0, g.1, g.2, t])?;
+            for t in &per_tool_order {
+                #[allow(clippy::cast_possible_wrap)]
+                let n = per_tool_sessions[t].len() as i64;
+                update.execute(rusqlite::params![n, g.0, g.1, g.2, t])?;
+            }
         }
     }
     Ok(())
@@ -339,6 +400,300 @@ mod tests {
     fn seed(c: &Connection) {
         testdb::project(c, 1, "p", "claude");
         testdb::session(c, 1, 1, "s1");
+    }
+
+    fn seed_batch_dimensions(c: &Connection) {
+        testdb::project(c, 1, "p1", "provider-a");
+        testdb::project(c, 2, "p2", "provider-b");
+        testdb::session(c, 1, 1, "one");
+        testdb::session(c, 2, 1, "two");
+        testdb::session(c, 3, 2, "three");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tool_event(
+        c: &Connection,
+        id: i64,
+        source_message_fk: Option<i64>,
+        session_fk: i64,
+        project_id: i64,
+        session_id: &str,
+        provider: &str,
+        day: &str,
+        tools_json: Option<&str>,
+        tokens: (i64, i64, i64, i64),
+        cost: f64,
+    ) {
+        if let (Some(message_id), Some(tools_json)) = (source_message_fk, tools_json) {
+            testdb::message(
+                c,
+                message_id,
+                session_fk,
+                id,
+                "2026-01-01T00:00:00Z",
+                "assistant",
+                "",
+                tools_json,
+                "{}",
+            );
+        }
+        testdb::event(
+            c,
+            id,
+            source_message_fk,
+            project_id,
+            session_id,
+            provider,
+            "m",
+            day,
+            tokens,
+            cost,
+        );
+    }
+
+    fn seed_batch_prefix(c: &Connection) {
+        tool_event(
+            c,
+            1,
+            Some(1),
+            1,
+            1,
+            "shared",
+            "provider-a",
+            "2026-01-01",
+            Some(r#"["Read","Read","Edit"]"#),
+            (8, 16, 4, 12),
+            1.0,
+        );
+        tool_event(
+            c,
+            2,
+            Some(2),
+            2,
+            1,
+            "shared",
+            "provider-a",
+            "2026-01-01",
+            Some(r#"["Read"]"#),
+            (4, 8, 0, 0),
+            0.5,
+        );
+        tool_event(
+            c,
+            3,
+            Some(3),
+            1,
+            1,
+            "alias",
+            "provider-a",
+            "2026-01-02",
+            Some("malformed"),
+            (2, 2, 0, 0),
+            2.0,
+        );
+    }
+
+    fn seed_batch_tail(c: &Connection) {
+        tool_event(
+            c,
+            4,
+            Some(4),
+            1,
+            1,
+            "alias",
+            "provider-a",
+            "2026-01-01",
+            Some(r#"["Edit","Write"]"#),
+            (4, 8, 2, 6),
+            0.5,
+        );
+        tool_event(
+            c,
+            5,
+            Some(999),
+            1,
+            1,
+            "missing",
+            "provider-a",
+            "2026-01-01",
+            None,
+            (4, 4, 0, 0),
+            4.0,
+        );
+        tool_event(
+            c,
+            6,
+            Some(6),
+            3,
+            2,
+            "other",
+            "provider-b",
+            "2026-01-01",
+            Some(r#"["Read",4,"","Read"]"#),
+            (4, 8, 0, 0),
+            0.25,
+        );
+        tool_event(
+            c,
+            7,
+            Some(7),
+            3,
+            2,
+            "other",
+            "provider-b",
+            "2026-01-02",
+            Some(r#"{"bad":1}"#),
+            (2, 2, 0, 0),
+            1.0,
+        );
+        tool_event(
+            c,
+            8,
+            Some(8),
+            3,
+            2,
+            "",
+            "provider-b",
+            "2026-01-01",
+            Some(r#"["Write"]"#),
+            (2, 4, 0, 0),
+            0.25,
+        );
+        tool_event(
+            c,
+            9,
+            Some(9),
+            1,
+            1,
+            "alias",
+            "provider-a",
+            "2026-01-01",
+            Some(r#"["Edit"]"#),
+            (2, 4, 0, 0),
+            0.25,
+        );
+    }
+
+    type ToolSnapshotRow = (
+        String,
+        i64,
+        String,
+        String,
+        i64,
+        i64,
+        u64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    );
+
+    fn tool_snapshot(c: &Connection, include_unaffected: bool) -> Vec<ToolSnapshotRow> {
+        let filter = if include_unaffected {
+            ""
+        } else {
+            "WHERE day != 'unaffected'"
+        };
+        c.prepare(&format!(
+            "SELECT day, project_id, provider, tool_name, event_count, calls_total, \
+                    cost_usd, tokens_in, tokens_out, cache_read, cache_create, session_count \
+             FROM tool_mart {filter} ORDER BY day, project_id, provider, tool_name"
+        ))
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get::<_, f64>(6)?.to_bits(),
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    fn mart_keys(c: &Connection) -> Vec<Key> {
+        c.prepare(
+            "SELECT day, project_id, provider, tool_name FROM tool_mart \
+             WHERE day != 'unaffected' ORDER BY day, project_id, provider, tool_name",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    fn recompute_session_counts_oracle(conn: &Connection, keys: &[Key]) {
+        let mut group_order: Vec<(String, i64, String)> = Vec::new();
+        let mut group_tools: HashMap<(String, i64, String), HashSet<String>> = HashMap::new();
+        for key in keys {
+            let group = (key.0.clone(), key.1, key.2.clone());
+            if let Some(tools) = group_tools.get_mut(&group) {
+                tools.insert(key.3.clone());
+            } else {
+                group_order.push(group.clone());
+                group_tools.insert(group, HashSet::from([key.3.clone()]));
+            }
+        }
+
+        let mut scan = conn
+            .prepare(
+                "SELECT e.session_id, m.tools_json FROM usage_events e \
+                 LEFT JOIN messages m ON m.id = e.source_message_fk \
+                 WHERE e.day = ? AND e.project_id = ? AND e.provider = ?",
+            )
+            .unwrap();
+        let mut update = conn
+            .prepare(
+                "UPDATE tool_mart SET session_count = ? \
+                 WHERE day = ? AND project_id = ? AND provider = ? AND tool_name = ?",
+            )
+            .unwrap();
+        for group in &group_order {
+            let wanted = &group_tools[group];
+            let rows: Vec<(String, Option<String>)> = scan
+                .query_map(rusqlite::params![group.0, group.1, group.2], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                        row.get(1)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let mut sessions: HashMap<String, HashSet<String>> = HashMap::new();
+            for (session_id, tools_json) in rows {
+                for (tool, _) in parse_tool_names(tools_json.as_deref()) {
+                    if wanted.contains(&tool) {
+                        sessions.entry(tool).or_default().insert(session_id.clone());
+                    }
+                }
+            }
+            for (tool, session_ids) in sessions {
+                update
+                    .execute(rusqlite::params![
+                        i64::try_from(session_ids.len()).unwrap(),
+                        group.0,
+                        group.1,
+                        group.2,
+                        tool
+                    ])
+                    .unwrap();
+            }
+        }
     }
 
     #[test]
@@ -578,5 +933,209 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tin, 3);
+    }
+
+    #[test]
+    fn batched_recompute_matches_the_incumbent_and_exact_window_schedules() {
+        let build_incremental = || {
+            let c = testdb::conn();
+            seed_batch_dimensions(&c);
+            seed_batch_prefix(&c);
+            assert_eq!(ToolMartBuilder.refresh(&c, 0).unwrap(), 3);
+            seed_batch_tail(&c);
+            assert_eq!(ToolMartBuilder.refresh(&c, 3).unwrap(), 9);
+            c.execute(
+                "INSERT INTO tool_mart \
+                 (day, project_id, provider, tool_name, session_count) \
+                 VALUES ('unaffected', 1, 'provider-a', 'Keep', 77)",
+                [],
+            )
+            .unwrap();
+            c
+        };
+
+        let optimized = build_incremental();
+        let incumbent = build_incremental();
+        let keys = mart_keys(&optimized);
+        optimized
+            .execute(
+                "UPDATE tool_mart SET session_count = 0 WHERE day != 'unaffected'",
+                [],
+            )
+            .unwrap();
+        incumbent
+            .execute(
+                "UPDATE tool_mart SET session_count = 0 WHERE day != 'unaffected'",
+                [],
+            )
+            .unwrap();
+        let mut accounting = SourceScanAccounting::default();
+        recompute_session_counts_with_accounting(&optimized, &keys, &mut accounting).unwrap();
+        recompute_session_counts_oracle(&incumbent, &keys);
+        assert_eq!(accounting.queries, 1);
+        assert_eq!(
+            tool_snapshot(&optimized, true),
+            tool_snapshot(&incumbent, true)
+        );
+        let unaffected: i64 = optimized
+            .query_row(
+                "SELECT session_count FROM tool_mart WHERE day = 'unaffected'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unaffected, 77);
+
+        let from_zero = testdb::conn();
+        seed_batch_dimensions(&from_zero);
+        seed_batch_prefix(&from_zero);
+        seed_batch_tail(&from_zero);
+        assert_eq!(ToolMartBuilder.refresh(&from_zero, 0).unwrap(), 9);
+        let incremental_snapshot = tool_snapshot(&optimized, false);
+        assert_eq!(
+            incremental_snapshot,
+            tool_snapshot(&from_zero, false),
+            "exact-representable fixture differs between incremental and from-zero"
+        );
+        ToolMartBuilder.rebuild_from_scratch(&from_zero).unwrap();
+        assert_eq!(incremental_snapshot, tool_snapshot(&from_zero, false));
+        let edit_sessions: i64 = from_zero
+            .query_row(
+                "SELECT session_count FROM tool_mart \
+                 WHERE day = '2026-01-01' AND project_id = 1 \
+                   AND provider = 'provider-a' AND tool_name = 'Edit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edit_sessions, 2);
+    }
+
+    #[test]
+    fn tool_source_queries_scale_by_chunks_and_materialize_once_per_chunk() {
+        let c = testdb::conn();
+        testdb::project(&c, 1, "p", "provider-a");
+        let mut keys = Vec::with_capacity(TOOL_GROUP_CHUNK + 1);
+        for index in 0..=TOOL_GROUP_CHUNK {
+            let day = format!("day-{index:03}");
+            let session_fk = i64::try_from(index).unwrap() + 1;
+            let session_id = format!("session-{index:03}");
+            let tool_name = if index == TOOL_GROUP_CHUNK {
+                "Tail"
+            } else {
+                "Read"
+            };
+            testdb::session(&c, session_fk, 1, &session_id);
+            testdb::message(
+                &c,
+                session_fk,
+                session_fk,
+                0,
+                &format!("{day}T00:00:00Z"),
+                "assistant",
+                "",
+                &format!(r#"["{tool_name}"]"#),
+                "{}",
+            );
+            testdb::event(
+                &c,
+                session_fk,
+                Some(session_fk),
+                1,
+                &session_id,
+                "provider-a",
+                "m",
+                &day,
+                (1, 1, 0, 0),
+                0.0,
+            );
+            c.execute(
+                "INSERT INTO tool_mart \
+                 (day, project_id, provider, tool_name, session_count) \
+                 VALUES (?, 1, 'provider-a', ?, 77)",
+                rusqlite::params![day, tool_name],
+            )
+            .unwrap();
+            keys.push((day, 1, "provider-a".to_string(), tool_name.to_string()));
+        }
+        c.execute(
+            "INSERT INTO tool_mart \
+             (day, project_id, provider, tool_name, session_count) \
+             VALUES ('unaffected', 1, 'provider-a', 'Read', 88)",
+            [],
+        )
+        .unwrap();
+        let mut accounting = SourceScanAccounting::default();
+        recompute_session_counts_with_accounting(&c, &keys, &mut accounting).unwrap();
+        assert_eq!(accounting.queries, 2);
+        let populated: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM tool_mart \
+                 WHERE day != 'unaffected' AND session_count = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(populated, i64::try_from(TOOL_GROUP_CHUNK + 1).unwrap());
+        let first_chunk_count: i64 = c
+            .query_row(
+                "SELECT session_count FROM tool_mart \
+                 WHERE day = 'day-000' AND tool_name = 'Read'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_chunk_count, 1);
+        let final_chunk_count: i64 = c
+            .query_row(
+                "SELECT session_count FROM tool_mart \
+                 WHERE day = ? AND tool_name = 'Tail'",
+                [format!("day-{TOOL_GROUP_CHUNK:03}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(final_chunk_count, 1, "final-chunk ordinal routed its row");
+        let unaffected: i64 = c
+            .query_row(
+                "SELECT session_count FROM tool_mart WHERE day = 'unaffected'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unaffected, 88);
+
+        let production = crate::ingest::testdb::store();
+        for partition in ["messages_202601", "messages_202602"] {
+            crate::ingest::writer::ensure_partition(&production, partition).unwrap();
+        }
+        let sql = format!("EXPLAIN QUERY PLAN {}", tool_group_batch_sql(2));
+        let params = [
+            SqlValue::Text("2026-01-01".to_string()),
+            SqlValue::Integer(1),
+            SqlValue::Text("provider-a".to_string()),
+            SqlValue::Text("2026-01-02".to_string()),
+            SqlValue::Integer(2),
+            SqlValue::Text("provider-b".to_string()),
+        ];
+        let plan: Vec<String> = production
+            .prepare(&sql)
+            .unwrap()
+            .query_map(params_from_iter(params.iter()), |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        eprintln!("tool affected-group batch plan: {plan:#?}");
+        assert_eq!(
+            plan.iter()
+                .filter(|detail| detail.as_str() == "MATERIALIZE messages")
+                .count(),
+            1,
+            "message-view work must occur once per source chunk: {plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|detail| detail == "USE TEMP B-TREE FOR ORDER BY"),
+            "batched rows must be ordered by affected ordinal and event id: {plan:#?}"
+        );
     }
 }

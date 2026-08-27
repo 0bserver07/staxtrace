@@ -1,0 +1,45 @@
+{
+  "title": "StaxTrace performance failure receipt",
+  "type": "object",
+  "required": [
+    "schema", "run_id", "policy_digest", "scenario", "profile", "runner",
+    "fixture", "status", "failure_kind", "elapsed_seconds", "timeout_seconds",
+    "exit_code"
+  ],
+  "properties": {
+    "schema": {"const": "staxtrace.performance-failure"},
+    "run_id": {"type": "string", "pattern": "^[a-f0-9]{32}$"},
+    "policy_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "scenario": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+    "profile": {"const": "release"},
+    "runner": {
+      "type": "object",
+      "required": ["os", "architecture", "runner_class", "toolchain", "key"],
+      "properties": {
+        "os": {"type": "string", "minLength": 1},
+        "architecture": {"type": "string", "minLength": 1},
+        "runner_class": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+$"},
+        "toolchain": {"type": "string", "minLength": 1},
+        "key": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "fixture": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"pattern": "^[a-z][a-z0-9_]{0,63}$"},
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    },
+    "status": {"const": "fail"},
+    "failure_kind": {
+      "enum": [
+        "timeout", "command_failure", "interrupted",
+        "evidence_validation_failure", "comparison_failure"
+      ]
+    },
+    "elapsed_seconds": {"type": "number", "minimum": 0},
+    "timeout_seconds": {"type": "number", "exclusiveMinimum": 0},
+    "exit_code": {"type": ["integer", "null"]}
+  },
+  "additionalProperties": false
+}

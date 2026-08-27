@@ -1,0 +1,52 @@
+{
+  "title": "StaxTrace additive performance scenario",
+  "type": "object",
+  "required": ["schema", "scenario", "fixture", "samples", "guard", "test", "resources"],
+  "properties": {
+    "schema": {"const": "staxtrace.performance-scenario"},
+    "scenario": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+    "fixture": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"pattern": "^[a-z][a-z0-9_]{0,63}$"},
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    },
+    "samples": {"type": ["integer", "null"], "minimum": 1},
+    "guard": {
+      "type": "object",
+      "required": ["metric", "comparison", "limit"],
+      "properties": {
+        "metric": {"enum": ["p99_ms", "throughput_per_second", "reader_p99_ms"]},
+        "comparison": {"enum": ["at_most", "at_least"]},
+        "limit": {"type": "number", "minimum": 0},
+        "errors": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "test": {
+      "type": "object",
+      "required": ["package", "integration_test", "test_name"],
+      "properties": {
+        "package": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"},
+        "integration_test": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+        "test_name": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"}
+      },
+      "additionalProperties": false
+    },
+    "resources": {
+      "type": "object",
+      "required": [
+        "mode", "minimum_rss_samples", "minimum_open_file_samples",
+        "child_process_samples"
+      ],
+      "properties": {
+        "mode": {"enum": ["edge", "continuous"]},
+        "minimum_rss_samples": {"type": "integer", "minimum": 2},
+        "minimum_open_file_samples": {"type": "integer", "minimum": 2},
+        "child_process_samples": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
