@@ -1031,7 +1031,7 @@ mod tests {
         let canonical_payload = obj(&[
             ("session_id", Value::Str("canonical-session".into())),
             ("stop_hook_active", Value::Bool(true)),
-            ("cwd", Value::Str("/home/u/proj".into())),
+            ("cwd", Value::Str("/workspace/project".into())),
         ]);
         assert_eq!(
             run("staxtrace-stop", &canonical_payload, false, &env),
@@ -1086,7 +1086,7 @@ mod tests {
                 "canonical-session".into(),
                 "staxtrace-stop".into(),
                 KIND_BOUNDARY.into(),
-                r#"{"hook_event_name": "Stop", "stop_hook_active": true, "cwd": "/home/u/proj", "session_totals": {"available": false}}"#.into(),
+                r#"{"hook_event_name": "Stop", "stop_hook_active": true, "cwd": "/workspace/project", "session_totals": {"available": false}}"#.into(),
             )
         );
         drop(conn);
