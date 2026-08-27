@@ -10,10 +10,10 @@
 //! policy digest, bounds the process group, and validates the complete JSON
 //! shape.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -25,6 +25,9 @@ pub const PEAK_RSS_LIMIT_BYTES: u64 = 1_073_741_824;
 pub const OPEN_FILE_LIMIT: u64 = 256;
 const OBSERVATION_INTERVAL_MILLISECONDS: u64 = 250;
 const OBSERVER_WALL_SECONDS_LIMIT: f64 = 30.0;
+const MAX_PROCESS_TREE_PIDS: usize = 4_096;
+const MAX_PROCESS_SAMPLE_ENTRIES: usize = 1_024;
+const MAX_PID_DECIMAL_BYTES: usize = 10;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Guard {
@@ -138,8 +141,8 @@ impl Resources {
 }
 
 /// Samples this test process at scenario edges or continuously. Continuous
-/// mode records both RSS and descriptors throughout the workload. Command-
-/// backed observer work is accumulated separately in the receipt.
+/// mode records both RSS and descriptors throughout the workload. Observer
+/// work is accumulated separately in the receipt.
 pub struct ResourceMonitor {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<Resources>>,
@@ -147,83 +150,179 @@ pub struct ResourceMonitor {
 
 /// Samples a spawned process and its descendants only after stdin has been
 /// delivered. Sampling runs concurrently with the child workload through its
-/// exit, so observer command wall time is recorded without being subtracted
-/// from the child latency distribution.
+/// exit, so observer wall time is recorded without being subtracted from the
+/// child latency distribution.
 pub struct ChildProcessMonitor {
-    begin: Arc<AtomicBool>,
-    sampling_started: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
+    control: Arc<(Mutex<ChildMonitorControl>, Condvar)>,
+    ready_wall: Duration,
     handle: Option<JoinHandle<Resources>>,
+}
+
+#[derive(Debug, Default)]
+struct ChildMonitorControl {
+    worker_ready: bool,
+    armed: bool,
+    first_sample_complete: bool,
+    stop: bool,
+    worker_done: bool,
+    #[cfg(test)]
+    first_sample_aggregate: Option<Resources>,
 }
 
 impl ChildProcessMonitor {
     #[must_use]
     pub fn start(root_pid: u32) -> Self {
-        let begin = Arc::new(AtomicBool::new(false));
-        let sampling_started = Arc::new(AtomicBool::new(false));
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_begin = Arc::clone(&begin);
-        let worker_started = Arc::clone(&sampling_started);
-        let worker_stop = Arc::clone(&stop);
+        Self::start_with_sampler(root_pid, sample_process_tree)
+    }
+
+    fn start_with_sampler(
+        root_pid: u32,
+        sampler: impl Fn(u32) -> Resources + Send + 'static,
+    ) -> Self {
+        let ready_started = Instant::now();
+        let control = Arc::new((Mutex::new(ChildMonitorControl::default()), Condvar::new()));
+        let worker_control = Arc::clone(&control);
         let handle = thread::spawn(move || {
-            while !worker_begin.load(Ordering::Acquire) && !worker_stop.load(Ordering::Acquire) {
-                thread::sleep(Duration::from_millis(1));
-            }
-            let mut resources = Resources {
+            // A failed sampler must wake begin_processing and fail closed. In
+            // particular, evidence from an earlier iteration is discarded if
+            // a later observer iteration panics.
+            let sampled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let (lock, wake) = &*worker_control;
+                let mut state = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.worker_ready = true;
+                wake.notify_all();
+                while !state.armed && !state.stop {
+                    state = wake
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                if state.stop {
+                    return Resources {
+                        continuous: true,
+                        ..Resources::default()
+                    };
+                }
+                drop(state);
+
+                let mut resources = Resources {
+                    continuous: true,
+                    ..Resources::default()
+                };
+                let mut observed_child = false;
+                loop {
+                    let sample = sampler(root_pid);
+                    observed_child |= sample.child_process_sample_count > 0;
+                    resources = resources.merge(sample);
+
+                    let mut state = lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    // Publish the barrier only after the complete attempt has
+                    // been merged, so the parent cannot reap a fast process
+                    // while its descriptor snapshot is still in flight.
+                    #[cfg(test)]
+                    if state.first_sample_aggregate.is_none() {
+                        state.first_sample_aggregate = Some(resources);
+                    }
+                    state.first_sample_complete = true;
+                    wake.notify_all();
+                    if state.stop {
+                        break;
+                    }
+                    drop(state);
+                    thread::yield_now();
+                }
+                resources.child_process_sample_count = u64::from(observed_child);
+                resources
+            }));
+
+            let resources = sampled.unwrap_or_else(|_| Resources {
                 continuous: true,
                 ..Resources::default()
-            };
-            let mut observed_child = false;
-            while !worker_stop.load(Ordering::Acquire) {
-                worker_started.store(true, Ordering::Release);
-                let sample = sample_process_tree(root_pid);
-                observed_child |= sample.child_process_sample_count > 0;
-                resources = resources.merge(sample);
-                thread::yield_now();
-            }
-            // If stop races the first scheduled observation, take one final
-            // post-input sample. A process that is already gone correctly
-            // contributes no successful evidence.
-            if !worker_started.load(Ordering::Acquire) {
-                worker_started.store(true, Ordering::Release);
-                let sample = sample_process_tree(root_pid);
-                observed_child |= sample.child_process_sample_count > 0;
-                resources = resources.merge(sample);
-            }
-            resources.child_process_sample_count = u64::from(observed_child);
+            });
+            let (lock, wake) = &*worker_control;
+            let mut state = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.worker_done = true;
+            wake.notify_all();
+            drop(state);
             resources
         });
-        Self {
-            begin,
-            sampling_started,
-            stop,
+        let mut monitor = Self {
+            control,
+            ready_wall: Duration::ZERO,
             handle: Some(handle),
+        };
+        {
+            let (lock, wake) = &*monitor.control;
+            let mut state = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !state.worker_ready && !state.worker_done {
+                state = wake
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
         }
+        monitor.ready_wall = ready_started.elapsed();
+        monitor
     }
 
     /// Arm observation after the real payload has been written and stdin has
-    /// been closed. Return only once the observer has begun its first sample.
+    /// been closed. Return only once the observer has merged its first complete
+    /// sample attempt, or has failed closed.
     pub fn begin_processing(&self) {
-        self.begin.store(true, Ordering::Release);
-        while !self.sampling_started.load(Ordering::Acquire) {
-            thread::yield_now();
+        let (lock, wake) = &*self.control;
+        let mut state = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.armed = true;
+        wake.notify_all();
+        while !state.first_sample_complete && !state.worker_done {
+            state = wake
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
+    }
+
+    fn request_stop(&self) {
+        let (lock, wake) = &*self.control;
+        let mut state = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.stop = true;
+        wake.notify_all();
+    }
+
+    #[cfg(test)]
+    fn first_sample_aggregate(&self) -> Option<Resources> {
+        self.control
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .first_sample_aggregate
     }
 
     #[must_use]
     pub fn stop(mut self) -> Resources {
-        self.stop.store(true, Ordering::Release);
-        self.handle
+        self.request_stop();
+        let mut resources = self
+            .handle
             .take()
             .expect("child resource monitor handle")
             .join()
-            .expect("child resource monitor thread")
+            .expect("child resource monitor thread");
+        resources.observer_wall = resources.observer_wall.saturating_add(self.ready_wall);
+        resources
     }
 }
 
 impl Drop for ChildProcessMonitor {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.request_stop();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -288,37 +387,51 @@ impl Drop for ResourceMonitor {
     }
 }
 
-fn process_tree_pids(root_pid: u32) -> Vec<u32> {
-    let output = std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid="])
-        .output();
-    let Some(text) = output
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-    else {
-        return vec![root_pid];
-    };
-    let relationships: Vec<(u32, u32)> = text
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
-        })
-        .collect();
-    let mut tree = BTreeSet::from([root_pid]);
-    loop {
-        let before = tree.len();
-        for (pid, parent) in &relationships {
-            if tree.contains(parent) {
-                tree.insert(*pid);
+#[derive(Debug, PartialEq, Eq)]
+struct ProcessTreeDiscovery {
+    pids: Vec<u32>,
+    complete: bool,
+}
+
+fn process_tree_pids(root_pid: u32) -> ProcessTreeDiscovery {
+    discover_process_tree(root_pid, direct_child_pids)
+}
+
+fn discover_process_tree(
+    root_pid: u32,
+    mut child_lookup: impl FnMut(u32) -> Option<Vec<u32>>,
+) -> ProcessTreeDiscovery {
+    let mut discovered = vec![root_pid];
+    let mut seen = BTreeSet::from([root_pid]);
+    let mut pending = VecDeque::from([root_pid]);
+    while let Some(parent_pid) = pending.pop_front() {
+        let Some(children) = child_lookup(parent_pid) else {
+            // A disappearing or inaccessible process contributes no invented
+            // descendants. Already discovered PIDs remain independently
+            // sampleable and must still produce complete per-process fields.
+            return ProcessTreeDiscovery {
+                pids: discovered,
+                complete: false,
+            };
+        };
+        for child_pid in children {
+            if child_pid == 0 || !seen.insert(child_pid) {
+                continue;
             }
-        }
-        if tree.len() == before {
-            break;
+            if discovered.len() == MAX_PROCESS_TREE_PIDS {
+                return ProcessTreeDiscovery {
+                    pids: discovered,
+                    complete: false,
+                };
+            }
+            discovered.push(child_pid);
+            pending.push_back(child_pid);
         }
     }
-    tree.into_iter().collect()
+    ProcessTreeDiscovery {
+        pids: discovered,
+        complete: true,
+    }
 }
 
 fn sample_process_tree(root_pid: u32) -> Resources {
@@ -330,13 +443,12 @@ fn sample_process_tree(root_pid: u32) -> Resources {
     let mut peak_open_files = root.peak_open_files;
     let mut rss_sample_count = root.rss_sample_count;
     let mut open_file_sample_count = root.open_file_sample_count;
-    let mut complete_observation = root.rss_sample_count > 0 && root.open_file_sample_count > 0;
-    for pid in process_tree_pids(root_pid)
-        .into_iter()
-        .filter(|pid| *pid != root_pid)
-    {
+    let tree = process_tree_pids(root_pid);
+    let mut complete_observation =
+        tree.complete && root.rss_sample_count > 0 && root.open_file_sample_count > 0;
+    for pid in tree.pids.into_iter().filter(|pid| *pid != root_pid) {
         let sample = sample_process(pid);
-        complete_observation |= sample.rss_sample_count > 0 && sample.open_file_sample_count > 0;
+        complete_observation &= sample.rss_sample_count > 0 && sample.open_file_sample_count > 0;
         peak_rss_bytes = peak_rss_bytes.saturating_add(sample.peak_rss_bytes);
         peak_open_files = peak_open_files.saturating_add(sample.peak_open_files);
         rss_sample_count = rss_sample_count.saturating_add(sample.rss_sample_count);
@@ -368,13 +480,7 @@ fn sample_process_tree(root_pid: u32) -> Resources {
 
 fn sample_process(pid: u32) -> Resources {
     let started = Instant::now();
-    // RSS and descriptor probes are independent. Launch them together so a
-    // fast child cannot exit in the gap between two sequential commands.
-    let (peak_rss_bytes, peak_open_files) = thread::scope(|scope| {
-        let rss = scope.spawn(|| sample_rss_bytes(pid));
-        let open_files = sample_open_files(pid);
-        (rss.join().expect("RSS observer thread"), open_files)
-    });
+    let (peak_rss_bytes, peak_open_files) = sample_process_values(pid);
     Resources {
         peak_rss_bytes: peak_rss_bytes.unwrap_or(0),
         peak_open_files: peak_open_files.unwrap_or(0),
@@ -388,40 +494,383 @@ fn sample_process(pid: u32) -> Resources {
     }
 }
 
-fn sample_rss_bytes(pid: u32) -> Option<u64> {
-    let pid = pid.to_string();
-    let output = std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid])
-        .output();
-    output
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .and_then(|text| text.split_whitespace().next()?.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .map(|value| value.saturating_mul(1024))
+#[cfg(target_os = "macos")]
+fn sample_process_values(pid: u32) -> (Option<u64>, Option<u64>) {
+    // Descriptor state disappears at exit, while proc_pid_rusage supports a
+    // zombie. Preserve this call order for short-lived workloads.
+    let open_files = macos_process::open_file_count(pid);
+    let rss_bytes = macos_process::resident_size(pid);
+    (rss_bytes, open_files)
 }
 
-fn sample_open_files(pid: u32) -> Option<u64> {
-    let proc_path = PathBuf::from("/proc").join(pid.to_string()).join("fd");
-    if let Ok(entries) = std::fs::read_dir(proc_path) {
-        let count = entries.flatten().count() as u64;
-        return (count > 0).then_some(count);
-    }
+#[cfg(target_os = "macos")]
+fn direct_child_pids(pid: u32) -> Option<Vec<u32>> {
+    macos_process::child_pids(pid)
+}
 
-    let pid = pid.to_string();
-    std::process::Command::new("lsof")
-        .args(["-n", "-P", "-p", &pid])
+#[cfg(target_os = "linux")]
+fn sample_process_values(pid: u32) -> (Option<u64>, Option<u64>) {
+    let root = PathBuf::from("/proc").join(pid.to_string());
+    // Match the macOS descriptor-first ordering for the state most likely to
+    // disappear at process exit.
+    let open_files = linux_open_file_count(&root.join("fd"));
+    let rss_bytes = std::fs::read_to_string(root.join("status"))
+        .ok()
+        .and_then(|status| parse_linux_rss_bytes(&status));
+    (rss_bytes, open_files)
+}
+
+#[cfg(target_os = "linux")]
+fn direct_child_pids(pid: u32) -> Option<Vec<u32>> {
+    let path = PathBuf::from("/proc")
+        .join(pid.to_string())
+        .join("task")
+        .join(pid.to_string())
+        .join("children");
+    let byte_cap = linux_child_list_byte_cap()?;
+    let contents = read_bounded_utf8(std::fs::File::open(path).ok()?, byte_cap)?;
+    parse_linux_child_pids(&contents)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn linux_child_list_byte_cap() -> Option<usize> {
+    MAX_PROCESS_TREE_PIDS.checked_mul(MAX_PID_DECIMAL_BYTES.checked_add(1)?)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn read_bounded_utf8(reader: impl std::io::Read, byte_cap: usize) -> Option<String> {
+    use std::io::Read as _;
+
+    let read_cap = byte_cap.checked_add(1)?;
+    let mut bytes = Vec::with_capacity(read_cap);
+    reader
+        .take(u64::try_from(read_cap).ok()?)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > byte_cap {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn parse_linux_rss_bytes(status: &str) -> Option<u64> {
+    let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
+    let mut fields = line.split_whitespace();
+    (fields.next()? == "VmRSS:").then_some(())?;
+    let kibibytes = parse_ascii_decimal_u64(fields.next()?)?;
+    (fields.next()? == "kB" && fields.next().is_none()).then_some(())?;
+    kibibytes.checked_mul(1_024).filter(|bytes| *bytes > 0)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn parse_linux_child_pids(contents: &str) -> Option<Vec<u32>> {
+    let mut pids = Vec::new();
+    for field in contents.split_whitespace() {
+        if pids.len() == MAX_PROCESS_TREE_PIDS {
+            return None;
+        }
+        let pid = parse_ascii_decimal_u32(field)?;
+        if pid == 0 {
+            return None;
+        }
+        pids.push(pid);
+    }
+    Some(pids)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_open_file_count(path: &Path) -> Option<u64> {
+    let mut count = 0_u64;
+    for entry in std::fs::read_dir(path).ok()? {
+        entry.ok()?;
+        count = count.checked_add(1)?;
+        if usize::try_from(count).ok()? >= MAX_PROCESS_SAMPLE_ENTRIES {
+            return None;
+        }
+    }
+    (count > 0).then_some(count)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn sample_process_values(pid: u32) -> (Option<u64>, Option<u64>) {
+    let pid_text = pid.to_string();
+    let rss = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid_text])
         .output()
         .ok()
         .filter(|out| out.status.success())
-        .and_then(|out| {
-            let count = String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .count()
-                .saturating_sub(1) as u64;
-            (count > 0).then_some(count)
+        .and_then(|out| parse_fallback_rss_bytes(&out.stdout));
+    let open_files = std::process::Command::new("lsof")
+        .args(["-n", "-P", "-a", "-p", &pid_text, "-Fpf"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| parse_fallback_open_file_count(&out.stdout, pid));
+    (rss, open_files)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn direct_child_pids(parent_pid: u32) -> Option<Vec<u32>> {
+    std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| parse_fallback_process_relationships(&out.stdout))
+        .and_then(|relationships| {
+            relationships
+                .iter()
+                .any(|(pid, _)| *pid == parent_pid)
+                .then(|| {
+                    relationships
+                        .into_iter()
+                        .filter_map(|(pid, parent)| (parent == parent_pid).then_some(pid))
+                        .collect()
+                })
         })
+}
+
+#[cfg(any(test, not(any(target_os = "macos", target_os = "linux"))))]
+fn parse_fallback_rss_bytes(output: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(output).ok()?;
+    let mut fields = text.split_whitespace();
+    let kibibytes = parse_ascii_decimal_u64(fields.next()?)?;
+    fields.next().is_none().then_some(())?;
+    kibibytes.checked_mul(1_024).filter(|bytes| *bytes > 0)
+}
+
+#[cfg(any(test, not(any(target_os = "macos", target_os = "linux"))))]
+fn parse_fallback_open_file_count(output: &[u8], expected_pid: u32) -> Option<u64> {
+    let text = std::str::from_utf8(output).ok()?;
+    let mut lines = text.lines();
+    let process = parse_ascii_decimal_u32(lines.next()?.strip_prefix('p')?)?;
+    if process == 0 || process != expected_pid {
+        return None;
+    }
+    let mut count = 0_u64;
+    for line in lines {
+        let descriptor = line.strip_prefix('f')?;
+        if descriptor.is_empty() || !descriptor.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return None;
+        }
+        count = count.checked_add(1)?;
+        if usize::try_from(count).ok()? >= MAX_PROCESS_SAMPLE_ENTRIES {
+            return None;
+        }
+    }
+    (count > 0).then_some(count)
+}
+
+#[cfg(any(test, not(any(target_os = "macos", target_os = "linux"))))]
+fn parse_fallback_process_relationships(output: &[u8]) -> Option<Vec<(u32, u32)>> {
+    let text = std::str::from_utf8(output).ok()?;
+    let mut relationships = Vec::new();
+    for line in text.lines() {
+        if relationships.len() == MAX_PROCESS_TREE_PIDS {
+            return None;
+        }
+        let mut fields = line.split_whitespace();
+        let pid = parse_ascii_decimal_u32(fields.next()?)?;
+        let parent = parse_ascii_decimal_u32(fields.next()?)?;
+        if pid == 0 || fields.next().is_some() {
+            return None;
+        }
+        relationships.push((pid, parent));
+    }
+    (!relationships.is_empty()).then_some(relationships)
+}
+
+fn parse_ascii_decimal_u32(field: &str) -> Option<u32> {
+    (!field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| field.parse::<u32>().ok())
+        .flatten()
+}
+
+fn parse_ascii_decimal_u64(field: &str) -> Option<u64> {
+    (!field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| field.parse::<u64>().ok())
+        .flatten()
+}
+
+#[cfg(target_os = "macos")]
+mod macos_process {
+    use super::MAX_PROCESS_SAMPLE_ENTRIES;
+    use std::ffi::{c_int, c_void};
+    use std::mem::{MaybeUninit, align_of, offset_of, size_of};
+
+    const PROC_PIDLISTFDS: c_int = 1;
+    const RUSAGE_INFO_V0: c_int = 0;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ProcFdInfo {
+        fd: i32,
+        fd_type: u32,
+    }
+
+    #[repr(C)]
+    struct RusageInfoV0 {
+        uuid: [u8; 16],
+        user_time: u64,
+        system_time: u64,
+        package_idle_wakeups: u64,
+        interrupt_wakeups: u64,
+        pageins: u64,
+        wired_size: u64,
+        resident_size: u64,
+        physical_footprint: u64,
+        process_start_absolute_time: u64,
+        process_exit_absolute_time: u64,
+    }
+
+    const _: () = assert!(size_of::<ProcFdInfo>() == 8);
+    const _: () = assert!(align_of::<ProcFdInfo>() == 4);
+    const _: () = assert!(offset_of!(ProcFdInfo, fd) == 0);
+    const _: () = assert!(offset_of!(ProcFdInfo, fd_type) == 4);
+    const _: () = assert!(size_of::<RusageInfoV0>() == 96);
+    const _: () = assert!(align_of::<RusageInfoV0>() == 8);
+    const _: () = assert!(offset_of!(RusageInfoV0, resident_size) == 64);
+
+    #[link(name = "proc")]
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: c_int,
+            flavor: c_int,
+            arg: u64,
+            buffer: *mut c_void,
+            buffer_size: c_int,
+        ) -> c_int;
+        fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *mut c_void) -> c_int;
+        fn proc_listchildpids(parent_pid: c_int, buffer: *mut c_void, buffer_size: c_int) -> c_int;
+        fn __error() -> *mut c_int;
+    }
+
+    pub(super) fn open_file_count(pid: u32) -> Option<u64> {
+        let pid = c_int::try_from(pid).ok()?;
+        let mut entries = [MaybeUninit::<ProcFdInfo>::uninit(); MAX_PROCESS_SAMPLE_ENTRIES];
+        let buffer_bytes = size_of_val(&entries);
+        let buffer_size = c_int::try_from(buffer_bytes).ok()?;
+        // SAFETY: entries is a live writable buffer of buffer_size bytes. The
+        // flavor's element layout and alignment are asserted above. The result
+        // is validated before deriving a count from the initialized prefix.
+        let returned = unsafe {
+            proc_pidinfo(
+                pid,
+                PROC_PIDLISTFDS,
+                0,
+                entries.as_mut_ptr().cast(),
+                buffer_size,
+            )
+        };
+        let count = validated_byte_count(returned, buffer_bytes, size_of::<ProcFdInfo>())?;
+        u64::try_from(count).ok().filter(|count| *count > 0)
+    }
+
+    pub(super) fn resident_size(pid: u32) -> Option<u64> {
+        let pid = c_int::try_from(pid).ok()?;
+        let mut info = MaybeUninit::<RusageInfoV0>::uninit();
+        // SAFETY: info points to writable storage with the SDK-pinned layout.
+        // A zero return is the API's complete-success contract; only then is
+        // the initialized structure read.
+        let returned =
+            unsafe { proc_pid_rusage(pid, RUSAGE_INFO_V0, info.as_mut_ptr().cast::<c_void>()) };
+        if returned != 0 {
+            return None;
+        }
+        // SAFETY: proc_pid_rusage returned its documented success code above.
+        let info = unsafe { info.assume_init() };
+        (info.resident_size > 0).then_some(info.resident_size)
+    }
+
+    pub(super) fn child_pids(pid: u32) -> Option<Vec<u32>> {
+        let pid = c_int::try_from(pid).ok()?;
+        let mut children = [MaybeUninit::<i32>::uninit(); MAX_PROCESS_SAMPLE_ENTRIES];
+        let buffer_bytes = size_of_val(&children);
+        let buffer_size = c_int::try_from(buffer_bytes).ok()?;
+        // SAFETY: children is initialized writable storage of buffer_size
+        // bytes. The validated return is an element count, not a byte count.
+        clear_errno()?;
+        let returned =
+            unsafe { proc_listchildpids(pid, children.as_mut_ptr().cast(), buffer_size) };
+        let errno = if returned == 0 { current_errno()? } else { 0 };
+        let count = validated_child_count(returned, errno, children.len())?;
+        (0..count)
+            .map(|index| {
+                // SAFETY: the API returned count initialized i32 elements,
+                // and count was validated against the backing capacity.
+                let child = unsafe { children[index].assume_init() };
+                u32::try_from(child).ok().filter(|pid| *pid > 0)
+            })
+            .collect()
+    }
+
+    fn clear_errno() -> Option<()> {
+        // SAFETY: Darwin's __error returns thread-local writable errno storage.
+        let errno = unsafe { __error() };
+        if errno.is_null() {
+            return None;
+        }
+        // SAFETY: the pointer was checked and is owned by the calling thread.
+        unsafe { errno.write(0) };
+        Some(())
+    }
+
+    fn current_errno() -> Option<c_int> {
+        // SAFETY: Darwin's __error returns thread-local errno storage.
+        let errno = unsafe { __error() };
+        (!errno.is_null()).then(|| {
+            // SAFETY: the pointer was checked and is owned by this thread.
+            unsafe { errno.read() }
+        })
+    }
+
+    fn validated_byte_count(
+        returned: c_int,
+        capacity: usize,
+        element_size: usize,
+    ) -> Option<usize> {
+        let returned = usize::try_from(returned).ok()?;
+        (returned > 0
+            && returned < capacity
+            && element_size > 0
+            && returned.is_multiple_of(element_size))
+        .then_some(returned / element_size)
+    }
+
+    fn validated_element_count(returned: c_int, capacity: usize) -> Option<usize> {
+        let returned = usize::try_from(returned).ok()?;
+        (returned < capacity).then_some(returned)
+    }
+
+    fn validated_child_count(returned: c_int, errno: c_int, capacity: usize) -> Option<usize> {
+        if returned == 0 && errno != 0 {
+            return None;
+        }
+        validated_element_count(returned, capacity)
+    }
+
+    #[cfg(test)]
+    pub(super) fn assert_sdk_layout_and_return_validation() {
+        assert_eq!(size_of::<ProcFdInfo>(), 8);
+        assert_eq!(align_of::<ProcFdInfo>(), 4);
+        assert_eq!(offset_of!(ProcFdInfo, fd_type), 4);
+        assert_eq!(size_of::<RusageInfoV0>(), 96);
+        assert_eq!(align_of::<RusageInfoV0>(), 8);
+        assert_eq!(offset_of!(RusageInfoV0, resident_size), 64);
+        assert_eq!(validated_byte_count(24, 64, 8), Some(3));
+        assert_eq!(validated_byte_count(-1, 64, 8), None);
+        assert_eq!(validated_byte_count(0, 64, 8), None);
+        assert_eq!(validated_byte_count(23, 64, 8), None);
+        assert_eq!(validated_byte_count(64, 64, 8), None);
+        assert_eq!(validated_byte_count(72, 64, 8), None);
+        assert_eq!(validated_element_count(3, 8), Some(3));
+        assert_eq!(validated_element_count(-1, 8), None);
+        assert_eq!(validated_element_count(8, 8), None);
+        assert_eq!(validated_child_count(0, 0, 8), Some(0));
+        assert_eq!(validated_child_count(0, 3, 8), None);
+        assert_eq!(validated_child_count(-1, 3, 8), None);
+    }
 }
 
 #[must_use]
@@ -886,6 +1335,251 @@ fn percentile(sorted: &[f64], percent: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn complete_child_sample() -> Resources {
+        Resources {
+            peak_rss_bytes: 4_096,
+            peak_open_files: 3,
+            child_peak_rss_bytes: 4_096,
+            child_peak_open_files: 3,
+            rss_sample_count: 1,
+            open_file_sample_count: 1,
+            child_process_sample_count: 1,
+            observer_wall: Duration::from_micros(1),
+            continuous: true,
+        }
+    }
+
+    #[test]
+    fn child_monitor_waits_for_the_first_completed_merged_attempt() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc::{TryRecvError, sync_channel};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let worker_attempts = Arc::clone(&attempts);
+        let (entered_tx, entered_rx) = sync_channel(0);
+        let (release_tx, release_rx) = sync_channel(0);
+        let monitor = ChildProcessMonitor::start_with_sampler(7, move |_| {
+            if worker_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                entered_tx.send(()).expect("publish first attempt entry");
+                release_rx.recv().expect("release first attempt");
+            }
+            complete_child_sample()
+        });
+        let (returned_tx, returned_rx) = sync_channel(0);
+        thread::scope(|scope| {
+            let monitor = &monitor;
+            scope.spawn(move || {
+                monitor.begin_processing();
+                returned_tx
+                    .send(
+                        monitor
+                            .first_sample_aggregate()
+                            .expect("first aggregate published before begin returns"),
+                    )
+                    .expect("publish begin return");
+            });
+            entered_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first attempt entered");
+            assert!(matches!(returned_rx.try_recv(), Err(TryRecvError::Empty)));
+            release_tx.send(()).expect("complete first attempt");
+            let aggregate = returned_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("begin returns after merge");
+            assert_eq!(aggregate.child_process_sample_count, 1);
+            assert_eq!(aggregate.child_peak_rss_bytes, 4_096);
+            assert_eq!(aggregate.child_peak_open_files, 3);
+        });
+        let resources = monitor.stop();
+        assert!(attempts.load(Ordering::SeqCst) > 0);
+        assert_eq!(resources.child_process_sample_count, 1);
+        assert_eq!(resources.child_peak_rss_bytes, 4_096);
+        assert_eq!(resources.child_peak_open_files, 3);
+    }
+
+    #[test]
+    fn child_monitor_repeated_begin_is_idempotent_and_stop_joins() {
+        let monitor = ChildProcessMonitor::start_with_sampler(7, |_| complete_child_sample());
+        monitor.begin_processing();
+        monitor.begin_processing();
+        let resources = monitor.stop();
+        assert_eq!(resources.child_process_sample_count, 1);
+    }
+
+    #[test]
+    fn child_monitor_unarmed_drop_wakes_without_sampling() {
+        let sampled = Arc::new(AtomicBool::new(false));
+        let worker_sampled = Arc::clone(&sampled);
+        let monitor = ChildProcessMonitor::start_with_sampler(7, move |_| {
+            worker_sampled.store(true, Ordering::SeqCst);
+            complete_child_sample()
+        });
+        drop(monitor);
+        assert!(!sampled.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn child_monitor_accounts_the_ready_handshake_wall_exactly_once() {
+        let monitor = ChildProcessMonitor::start_with_sampler(7, |_| {
+            panic!("unarmed monitor must not sample")
+        });
+        let ready_wall = monitor.ready_wall;
+        let resources = monitor.stop();
+        assert_eq!(resources.observer_wall, ready_wall);
+        assert_eq!(resources.child_process_sample_count, 0);
+    }
+
+    #[test]
+    fn child_monitor_worker_failure_wakes_and_discards_evidence() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc::sync_channel;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let worker_attempts = Arc::clone(&attempts);
+        let (failing_tx, failing_rx) = sync_channel(0);
+        let monitor = ChildProcessMonitor::start_with_sampler(7, move |_| -> Resources {
+            if worker_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return complete_child_sample();
+            }
+            failing_tx.send(()).expect("publish failing attempt");
+            panic!("injected sampler failure after successful evidence")
+        });
+        monitor.begin_processing();
+        failing_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker reaches failing attempt");
+        let resources = monitor.stop();
+        assert_eq!(resources.peak_rss_bytes, 0);
+        assert_eq!(resources.peak_open_files, 0);
+        assert_eq!(resources.rss_sample_count, 0);
+        assert_eq!(resources.open_file_sample_count, 0);
+        assert_eq!(resources.child_process_sample_count, 0);
+    }
+
+    #[test]
+    fn process_tree_discovery_is_recursive_deduplicated_bounded_and_fail_closed() {
+        let discovered = discover_process_tree(1, |pid| match pid {
+            1 => Some(vec![2, 2]),
+            2 => Some(vec![1, 3]),
+            3 => Some(Vec::new()),
+            _ => None,
+        });
+        assert_eq!(
+            discovered,
+            ProcessTreeDiscovery {
+                pids: vec![1, 2, 3],
+                complete: true,
+            }
+        );
+
+        let partial = discover_process_tree(1, |pid| (pid == 1).then_some(vec![2]));
+        assert_eq!(
+            partial,
+            ProcessTreeDiscovery {
+                pids: vec![1, 2],
+                complete: false,
+            }
+        );
+
+        let bounded = discover_process_tree(1, |pid| Some(vec![pid.saturating_add(1)]));
+        assert_eq!(bounded.pids.len(), MAX_PROCESS_TREE_PIDS);
+        assert!(!bounded.complete);
+    }
+
+    #[test]
+    fn native_sampler_observes_the_current_process_completely() {
+        let resources = sample_process(std::process::id());
+        assert!(resources.peak_rss_bytes > 0);
+        assert!(resources.peak_open_files > 0);
+        assert_eq!(resources.rss_sample_count, 1);
+        assert_eq!(resources.open_file_sample_count, 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_process_ffi_matches_the_pinned_sdk_contract() {
+        macos_process::assert_sdk_layout_and_return_validation();
+    }
+
+    #[test]
+    fn linux_proc_parsers_are_strict_and_checked() {
+        use std::io::Cursor;
+
+        assert_eq!(
+            parse_linux_rss_bytes("Name:\tfixture\nVmRSS:\t123 kB\n"),
+            Some(123 * 1_024)
+        );
+        assert_eq!(parse_linux_rss_bytes("VmRSS:\t0 kB\n"), None);
+        assert_eq!(parse_linux_rss_bytes("VmRSS:\t123 bytes\n"), None);
+        assert_eq!(parse_linux_rss_bytes("VmRSS:\t123 kB surplus\n"), None);
+        assert_eq!(parse_linux_rss_bytes("VmRSS:\t+123 kB\n"), None);
+        assert_eq!(parse_linux_rss_bytes("VmRSS:\tinvalid kB\n"), None);
+        assert_eq!(parse_linux_child_pids("2 3 5\n"), Some(vec![2, 3, 5]));
+        assert_eq!(parse_linux_child_pids(""), Some(Vec::new()));
+        assert_eq!(parse_linux_child_pids("0\n"), None);
+        assert_eq!(parse_linux_child_pids("+2\n"), None);
+        assert_eq!(parse_linux_child_pids("-2\n"), None);
+        assert_eq!(parse_linux_child_pids("2 invalid\n"), None);
+        assert_eq!(parse_linux_child_pids("4294967296\n"), None);
+
+        let boundary = "1 ".repeat(MAX_PROCESS_TREE_PIDS);
+        assert_eq!(
+            parse_linux_child_pids(&boundary)
+                .expect("entry-cap boundary")
+                .len(),
+            MAX_PROCESS_TREE_PIDS
+        );
+        let oversized_entries = format!("{boundary}1");
+        assert_eq!(parse_linux_child_pids(&oversized_entries), None);
+
+        let byte_cap = linux_child_list_byte_cap().expect("checked child-list byte cap");
+        let exact = vec![b'1'; byte_cap];
+        assert_eq!(
+            read_bounded_utf8(Cursor::new(exact.clone()), byte_cap)
+                .expect("exact byte-cap input")
+                .len(),
+            byte_cap
+        );
+        let mut oversized_bytes = exact;
+        oversized_bytes.push(b'1');
+        assert_eq!(
+            read_bounded_utf8(Cursor::new(oversized_bytes), byte_cap),
+            None
+        );
+        assert_eq!(read_bounded_utf8(Cursor::new(vec![0xff]), byte_cap), None);
+    }
+
+    #[test]
+    fn unsupported_platform_command_fallback_parsers_are_fail_closed() {
+        assert_eq!(parse_fallback_rss_bytes(b"123\n"), Some(123 * 1_024));
+        assert_eq!(parse_fallback_rss_bytes(b"0\n"), None);
+        assert_eq!(parse_fallback_rss_bytes(b"123 surplus\n"), None);
+        assert_eq!(parse_fallback_rss_bytes(b"+123\n"), None);
+        assert_eq!(parse_fallback_rss_bytes(b"invalid\n"), None);
+        assert_eq!(parse_fallback_rss_bytes(&[0xff]), None);
+        assert_eq!(
+            parse_fallback_open_file_count(b"p42\nf0\nfcwd\n", 42),
+            Some(2)
+        );
+        assert_eq!(parse_fallback_open_file_count(b"p42\n", 42), None);
+        assert_eq!(parse_fallback_open_file_count(b"p41\nf0\n", 42), None);
+        assert_eq!(parse_fallback_open_file_count(b"p+42\nf0\n", 42), None);
+        assert_eq!(parse_fallback_open_file_count(b"p42\nf\n", 42), None);
+        assert_eq!(parse_fallback_open_file_count(b"p42\nx0\n", 42), None);
+        assert_eq!(parse_fallback_open_file_count(b"p42\nf0\np42\n", 42), None);
+        assert_eq!(parse_fallback_open_file_count(&[0xff], 42), None);
+        assert_eq!(
+            parse_fallback_process_relationships(b"2 1\n3 2\n"),
+            Some(vec![(2, 1), (3, 2)])
+        );
+        assert_eq!(parse_fallback_process_relationships(b""), None);
+        assert_eq!(parse_fallback_process_relationships(b"0 1\n"), None);
+        assert_eq!(parse_fallback_process_relationships(b"+2 1\n"), None);
+        assert_eq!(parse_fallback_process_relationships(b"2 invalid\n"), None);
+        assert_eq!(parse_fallback_process_relationships(b"2 1 surplus\n"), None);
+        assert_eq!(parse_fallback_process_relationships(&[0xff]), None);
+    }
 
     #[test]
     fn nearest_rank_percentiles_are_distributional() {

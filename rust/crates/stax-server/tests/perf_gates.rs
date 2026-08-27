@@ -406,6 +406,48 @@ fn installed_hook_execution_distribution() {
     );
 }
 
+#[test]
+fn child_monitor_observes_fast_post_input_roots_before_reaping() {
+    use std::io::Write as _;
+
+    let workload = r#"import sys
+sys.stdin.buffer.read()
+sum(index * index for index in range(125000))
+"#;
+    for invocation in 0..32 {
+        let mut child = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(workload)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn fast post-input root");
+        let monitor = perf::ChildProcessMonitor::start(child.id());
+        {
+            child
+                .stdin
+                .take()
+                .expect("fast-root stdin")
+                .write_all(format!("begin-{invocation}").as_bytes())
+                .expect("release fast root");
+        }
+        monitor.begin_processing();
+        assert!(child.wait().expect("wait fast root").success());
+        assert!(
+            child
+                .try_wait()
+                .expect("confirm fast root reaped")
+                .is_some(),
+            "fast root remains unreaped"
+        );
+        let resources = monitor.stop();
+        assert_eq!(resources.child_process_sample_count, 1);
+        assert!(resources.child_peak_rss_bytes > 0);
+        assert!(resources.child_peak_open_files > 0);
+    }
+}
+
 fn count_table(conn: &Connection, table: &str) -> u64 {
     let count: i64 = conn
         .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
