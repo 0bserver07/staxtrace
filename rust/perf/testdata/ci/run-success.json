@@ -1,0 +1,9 @@
+{
+  "id": 41,
+  "run_attempt": 2,
+  "workflow_id": 7,
+  "path": ".github/workflows/perf.yml@refs/heads/main",
+  "status": "completed",
+  "conclusion": "success",
+  "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

@@ -1,0 +1,72 @@
+{
+  "title": "StaxTrace hosted performance qualification",
+  "type": "object",
+  "required": [
+    "schema", "qualification", "reason", "baseline_source", "baseline_selector",
+    "protected_manifest_digest",
+    "workflow_path", "workflow_run_id",
+    "workflow_run_attempt", "source_commit", "policy_digest",
+    "scenario_identity_digest", "evidence_schema_digest", "runner_label", "runner_key",
+    "absolute_suite_digest", "suite_digest", "resolution_digest", "baseline_digest",
+    "baseline_provenance_digest", "baseline_resolution_digest", "comparison_eligible",
+    "publication_eligible"
+  ],
+  "properties": {
+    "schema": {"const": "staxtrace.performance-ci-qualification"},
+    "qualification": {
+      "enum": [
+        "baseline_candidate", "pending_comparable_baseline", "qualified"
+      ]
+    },
+    "reason": {
+      "enum": [
+        "no_selector", "artifact_unavailable", "artifact_expired",
+        "incompatible_runner", "comparable"
+      ]
+    },
+    "baseline_source": {"enum": ["none", "prior_run", "protected_manifest"]},
+    "baseline_selector": {
+      "type": ["string", "null"],
+      "pattern": "^[1-9][0-9]{0,19}:[1-9][0-9]{0,9}$"
+    },
+    "protected_manifest_digest": {
+      "type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"
+    },
+    "workflow_path": {"const": ".github/workflows/perf.yml"},
+    "workflow_run_id": {
+      "type": "integer", "minimum": 1, "maximum": 9223372036854775807
+    },
+    "workflow_run_attempt": {
+      "type": "integer", "minimum": 1, "maximum": 2147483647
+    },
+    "source_commit": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+    "policy_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "scenario_identity_digest": {
+      "type": "string", "pattern": "^[a-f0-9]{64}$"
+    },
+    "evidence_schema_digest": {
+      "type": "string", "pattern": "^[a-f0-9]{64}$"
+    },
+    "runner_label": {
+      "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "runner_key": {"type": "string", "minLength": 1, "maxLength": 255},
+    "absolute_suite_digest": {
+      "type": "string", "pattern": "^[a-f0-9]{64}$"
+    },
+    "suite_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "resolution_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "baseline_digest": {
+      "type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"
+    },
+    "baseline_provenance_digest": {
+      "type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"
+    },
+    "baseline_resolution_digest": {
+      "type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"
+    },
+    "comparison_eligible": {"type": "boolean"},
+    "publication_eligible": {"const": false}
+  },
+  "additionalProperties": false
+}

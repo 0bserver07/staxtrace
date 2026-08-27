@@ -1,0 +1,26 @@
+{
+  "title": "StaxTrace hosted performance absolute-suite snapshot",
+  "type": "object",
+  "required": [
+    "schema", "suite_digest", "run_id", "policy_digest",
+    "scenario_identity_digest", "evidence_schema_digest", "runner_label",
+    "runner_key"
+  ],
+  "properties": {
+    "schema": {"const": "staxtrace.performance-ci-suite-snapshot"},
+    "suite_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "run_id": {"type": "string", "pattern": "^[a-f0-9]{32}$"},
+    "policy_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "scenario_identity_digest": {
+      "type": "string", "pattern": "^[a-f0-9]{64}$"
+    },
+    "evidence_schema_digest": {
+      "type": "string", "pattern": "^[a-f0-9]{64}$"
+    },
+    "runner_label": {
+      "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "runner_key": {"type": "string", "minLength": 1, "maxLength": 255}
+  },
+  "additionalProperties": false
+}
