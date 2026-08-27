@@ -51,6 +51,8 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+const UI_BUNDLE_RECEIPT: &str = "ui-bundle-provenance.json";
+
 fn main() {
     let manifest = PathBuf::from(
         std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo always sets CARGO_MANIFEST_DIR"),
@@ -72,6 +74,12 @@ fn main() {
     assert!(
         !files.is_empty(),
         "{} is empty — nothing to serve",
+        root.display()
+    );
+    assert!(
+        files.iter().any(|(key, _)| key == UI_BUNDLE_RECEIPT),
+        "{} is missing from {} — the embedded dashboard has no provenance receipt",
+        UI_BUNDLE_RECEIPT,
         root.display()
     );
 

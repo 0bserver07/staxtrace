@@ -175,7 +175,7 @@ test('triggerEtlBackfill on 404 raises EtlPipelineNotReadyError with CLI hint', 
   try {
     await assert.rejects(triggerEtlBackfill, (err) => {
       assert.ok(err instanceof EtlPipelineNotReadyError)
-      assert.match(err.message, /stackunderflow etl backfill/)
+      assert.match(err.message, /stax etl backfill/)
       return true
     })
   } finally {
