@@ -1,0 +1,123 @@
+{
+  "schema": "staxtrace.performance-workloads",
+  "suite_timeout_seconds": 900,
+  "setup_timeout_seconds": 900,
+  "scenario_timeout_seconds": 180,
+  "runner_classes": ["local", "dedicated", "hosted"],
+  "resource_limits": {
+    "peak_rss_bytes": 1073741824,
+    "open_files": 256
+  },
+  "resource_observation": {
+    "interval_milliseconds": 250,
+    "observer_wall_seconds_limit": 30.0
+  },
+  "baseline_policy": {
+    "clean_run_count": 3,
+    "latency_regression_fraction": 0.20,
+    "rss_regression_fraction": 0.20,
+    "open_file_regression_fraction": 0.20,
+    "throughput_regression_fraction": 0.15
+  },
+  "scenarios": {
+    "query_cold": {
+      "fixture": {"messages": 100000, "sessions": 1000, "projects": 20},
+      "samples": 100,
+      "guard": {"metric": "p99_ms", "comparison": "at_most", "limit": 1500.0},
+      "test": {"package": "stax-server", "integration_test": "perf_gates", "test_name": "cold_and_warm_query_distributions"},
+      "resources": {"mode": "edge", "minimum_rss_samples": 2, "minimum_open_file_samples": 2, "child_process_samples": 0}
+    },
+    "query_warm": {
+      "fixture": {"messages": 100000, "sessions": 1000, "projects": 20},
+      "samples": 100,
+      "guard": {"metric": "p99_ms", "comparison": "at_most", "limit": 250.0},
+      "test": {"package": "stax-server", "integration_test": "perf_gates", "test_name": "cold_and_warm_query_distributions"},
+      "resources": {"mode": "edge", "minimum_rss_samples": 2, "minimum_open_file_samples": 2, "child_process_samples": 0}
+    },
+    "one_file_append": {
+      "fixture": {"events_per_file": 1000, "files": 1},
+      "samples": 30,
+      "guard": {"metric": "throughput_per_second", "comparison": "at_least", "limit": 1000.0},
+      "test": {"package": "stax-etl", "integration_test": "perf_gates", "test_name": "one_file_append_distribution"},
+      "resources": {"mode": "continuous", "minimum_rss_samples": 2, "minimum_open_file_samples": 2, "child_process_samples": 0}
+    },
+    "batch_ingest": {
+      "fixture": {"events_per_file": 1000, "files": 20, "events": 20000},
+      "samples": 10,
+      "guard": {"metric": "throughput_per_second", "comparison": "at_least", "limit": 2000.0},
+      "test": {"package": "stax-etl", "integration_test": "perf_gates", "test_name": "multi_file_batch_ingest_distribution"},
+      "resources": {"mode": "continuous", "minimum_rss_samples": 2, "minimum_open_file_samples": 2, "child_process_samples": 0}
+    },
+    "noop_refresh": {
+      "fixture": {"unchanged_files": 20, "events": 20000},
+      "samples": 100,
+      "guard": {"metric": "p99_ms", "comparison": "at_most", "limit": 100.0},
+      "test": {"package": "stax-etl", "integration_test": "perf_gates", "test_name": "unchanged_multi_file_refresh_distribution"},
+      "resources": {"mode": "continuous", "minimum_rss_samples": 2, "minimum_open_file_samples": 2, "child_process_samples": 0}
+    },
+    "incremental_reindex": {
+      "fixture": {
+        "corpus_rows": 100000,
+        "prefix_rows": 90000,
+        "changed_rows": 10000,
+        "message_rows": 120000,
+        "assistant_source_messages": 100000,
+        "user_prompts": 10000,
+        "tool_result_messages": 10000,
+        "source_linked_events": 100000,
+        "tool_events": 10000,
+        "projects": 20,
+        "sessions": 1000,
+        "days": 28,
+        "tail_projects": 20,
+        "tail_sessions": 1000,
+        "tail_days": 28,
+        "tail_day_project_groups": 140,
+        "registered_marts": 8
+      },
+      "samples": 10,
+      "guard": {"metric": "throughput_per_second", "comparison": "at_least", "limit": 2000.0},
+      "test": {"package": "stax-etl", "integration_test": "perf_gates", "test_name": "incremental_reindex_distribution"},
+      "resources": {"mode": "continuous", "minimum_rss_samples": 2, "minimum_open_file_samples": 2, "child_process_samples": 0}
+    },
+    "full_reindex": {
+      "fixture": {
+        "corpus_rows": 100000,
+        "prefix_rows": 90000,
+        "changed_rows": 10000,
+        "message_rows": 120000,
+        "assistant_source_messages": 100000,
+        "user_prompts": 10000,
+        "tool_result_messages": 10000,
+        "source_linked_events": 100000,
+        "tool_events": 10000,
+        "projects": 20,
+        "sessions": 1000,
+        "days": 28,
+        "tail_projects": 20,
+        "tail_sessions": 1000,
+        "tail_days": 28,
+        "tail_day_project_groups": 140,
+        "registered_marts": 8
+      },
+      "samples": 5,
+      "guard": {"metric": "throughput_per_second", "comparison": "at_least", "limit": 1500.0},
+      "test": {"package": "stax-etl", "integration_test": "perf_gates", "test_name": "full_reindex_distribution"},
+      "resources": {"mode": "continuous", "minimum_rss_samples": 2, "minimum_open_file_samples": 2, "child_process_samples": 0}
+    },
+    "concurrent_read_write": {
+      "fixture": {"writers": 1, "readers": 8, "duration_seconds": 30},
+      "samples": null,
+      "guard": {"metric": "reader_p99_ms", "comparison": "at_most", "limit": 500.0, "errors": 0},
+      "test": {"package": "stax-etl", "integration_test": "perf_gates", "test_name": "concurrent_writer_and_readers_distribution"},
+      "resources": {"mode": "continuous", "minimum_rss_samples": 2, "minimum_open_file_samples": 2, "child_process_samples": 0}
+    },
+    "hook_execution": {
+      "fixture": {"hook_invocations": 200, "recorded_events": 200},
+      "samples": 200,
+      "guard": {"metric": "p99_ms", "comparison": "at_most", "limit": 50.0},
+      "test": {"package": "stax-server", "integration_test": "perf_gates", "test_name": "installed_hook_execution_distribution"},
+      "resources": {"mode": "continuous", "minimum_rss_samples": 202, "minimum_open_file_samples": 202, "child_process_samples": 200}
+    }
+  }
+}
