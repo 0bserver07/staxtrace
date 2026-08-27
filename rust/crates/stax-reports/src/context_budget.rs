@@ -1040,8 +1040,12 @@ mod tests {
         std::fs::create_dir_all(skills.join("no-skill-md")).expect("mkdir");
         // A loose FILE in skills/ is not a skill — the `is_dir()` guard.
         write(&skills.join("README.md"), b"ignored");
-        // Case matters here too: `skill.md` is not `SKILL.md`.
-        write(&skills.join("lower").join("skill.md"), b"ignored");
+        // A different filename is not a skill.  Do not use a case-only
+        // spelling here: case-insensitive filesystems resolve it as SKILL.md.
+        write(
+            &skills.join("not-a-skill").join("INSTRUCTIONS.md"),
+            b"ignored",
+        );
 
         let budget = estimate_context_budget(&project, &home);
         assert_eq!(
