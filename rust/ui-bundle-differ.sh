@@ -9,9 +9,26 @@ readonly PINNED_NODE="v22.18.0"
 readonly PINNED_NPM="10.9.3"
 readonly RECEIPT_RELATIVE="rust/assets/static/ui-bundle-provenance.json"
 
+DIFFER_SCRATCH_BASE=""
+DIFFER_SCRATCH_ROOT=""
+
 die() {
   printf 'ui-bundle-differ: %s\n' "$*" >&2
   exit 1
+}
+
+cleanup() {
+  case "$DIFFER_SCRATCH_ROOT" in
+    "$DIFFER_SCRATCH_BASE"/staxtrace-ui-bundle.*)
+      chmod -R u+w "$DIFFER_SCRATCH_ROOT" 2>/dev/null || true
+      rm -rf -- "$DIFFER_SCRATCH_ROOT"
+      ;;
+    "") ;;
+    *)
+      printf 'ui-bundle-differ: refusing to clean unexpected path\n' >&2
+      return 1
+      ;;
+  esac
 }
 
 verify_toolchain() {
@@ -144,18 +161,8 @@ main() {
   checkout="$scratch_root/checkout"
   expected_output="$scratch_root/expected-react"
   actual_receipt="$scratch_root/actual-receipt.json"
-
-  cleanup() {
-    case "$scratch_root" in
-      "$scratch_base"/staxtrace-ui-bundle.*)
-        chmod -R u+w "$scratch_root" 2>/dev/null || true
-        rm -rf -- "$scratch_root"
-        ;;
-      *)
-        printf 'ui-bundle-differ: refusing to clean unexpected path\n' >&2
-        ;;
-    esac
-  }
+  DIFFER_SCRATCH_BASE="$scratch_base"
+  DIFFER_SCRATCH_ROOT="$scratch_root"
   trap cleanup EXIT
 
   mkdir -p "$checkout" "$expected_output"
