@@ -78,6 +78,13 @@ pub fn tag(entries: Vec<RawEntry>) -> Vec<TaggedEntry> {
     entries.into_iter().map(classify).collect()
 }
 
+/// One entry of [`tag`], for callers that stream rows rather than batch them
+/// — the mart path, which must not hold a project's payloads all at once.
+#[must_use]
+pub fn tag_one(entry: RawEntry) -> TaggedEntry {
+    classify(entry)
+}
+
 fn classify(entry: RawEntry) -> TaggedEntry {
     let kind = determine_kind(&entry.payload);
     let text = surface_text(&entry.payload);

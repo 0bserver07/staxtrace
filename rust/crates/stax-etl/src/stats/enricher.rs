@@ -35,8 +35,8 @@
 
 use serde_json::Value;
 
-use super::classifier::TaggedEntry;
-use super::pytext::{py_char_prefix, py_str, py_truthy};
+use super::classifier::{INTERRUPT_API, INTERRUPT_PREFIX, TaggedEntry};
+use super::pytext::{py_char_prefix, py_str, py_strip, py_truthy};
 use super::sha256;
 
 /// How much of each entry to materialise.
@@ -215,7 +215,20 @@ pub struct Record {
     /// echoes it, and neither coerces.
     pub model: Value,
     /// `_text_from(raw)` — the flattening extraction, not the classifier's.
+    ///
+    /// Under [`Detail::Lean`] this is only the first 64 chars: the interaction
+    /// key's material, which is the one thing the mart path reads from it. The
+    /// two predicates the mart path also needs are computed from the full text
+    /// before it is dropped — [`Record::content_is_interrupt`] and
+    /// [`Record::content_is_api_abort`]. A project's worth of full texts was the
+    /// bulk of the resident's per-tick peak.
     pub content: String,
+    /// `_is_interrupt_text(content)` over the FULL text — an interruption
+    /// marker opens it.
+    pub content_is_interrupt: bool,
+    /// `content.strip() == INTERRUPT_API` over the FULL text — an aborted-request
+    /// turn, which `_next_is_interrupt` looks for after a command.
+    pub content_is_api_abort: bool,
     /// `_usage_from(msg)` plus the `reasoning` overlay.
     pub tokens: TokenBag,
     /// `_tools_from(msg)`.
@@ -319,13 +332,13 @@ pub struct EnrichedDataset {
 
 /// `enricher.build`, mart-path detail. See [`build_with`].
 #[must_use]
-pub fn build(tagged: Vec<TaggedEntry>) -> EnrichedDataset {
+pub fn build<I: IntoIterator<Item = TaggedEntry>>(tagged: I) -> EnrichedDataset {
     build_with(tagged, Detail::Lean)
 }
 
 /// `enricher.build`, aggregator detail. See [`build_with`].
 #[must_use]
-pub fn build_detailed(tagged: Vec<TaggedEntry>) -> EnrichedDataset {
+pub fn build_detailed<I: IntoIterator<Item = TaggedEntry>>(tagged: I) -> EnrichedDataset {
     build_with(tagged, Detail::Full)
 }
 
@@ -342,8 +355,15 @@ pub fn build_detailed(tagged: Vec<TaggedEntry>) -> EnrichedDataset {
 /// merges two unrelated interactions and this port does not. The wave-3
 /// full-row diff over the live store is the evidence that no such collision
 /// exists there.
+///
+/// `tagged` may be a lazy iterator: step 1 consumes it one entry at a time and
+/// keeps only the [`Record`], so a caller that streams rows from the store
+/// never holds more than one payload. A `Vec` still works as before.
 #[must_use]
-pub fn build_with(tagged: Vec<TaggedEntry>, detail: Detail) -> EnrichedDataset {
+pub fn build_with<I: IntoIterator<Item = TaggedEntry>>(
+    tagged: I,
+    detail: Detail,
+) -> EnrichedDataset {
     // step 1 — extract_records
     let records: Vec<Record> = tagged
         .into_iter()
@@ -505,6 +525,13 @@ fn parse_entry(te: TaggedEntry, detail: Detail) -> Record {
     let model_named = py_truthy(&model) && model.as_str() != Some("N/A");
 
     let content = text_from(&raw);
+    let content_is_interrupt =
+        content.starts_with(INTERRUPT_PREFIX) || content.starts_with(INTERRUPT_API);
+    let content_is_api_abort = py_strip(&content) == INTERRUPT_API;
+    let content = match detail {
+        Detail::Lean => py_char_prefix(&content, 64).to_string(),
+        Detail::Full => content,
+    };
     let tools = tools_from(msg, detail);
     let has_tool_result = has_result_block(msg);
     let speed = speed_from(msg);
@@ -547,6 +574,8 @@ fn parse_entry(te: TaggedEntry, detail: Detail) -> Record {
         timestamp,
         model,
         content,
+        content_is_interrupt,
+        content_is_api_abort,
         cache_read_truthy: tokens.cache_read != 0,
         tokens,
         tools,

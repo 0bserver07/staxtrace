@@ -25,7 +25,6 @@
 
 use super::classifier::{INTERRUPT_API, INTERRUPT_PREFIX};
 use super::enricher::{EnrichedDataset, Interaction, Record, interaction_key};
-use super::pytext::py_strip;
 
 /// The three numerators `_count_interaction_dims` reads off `_command_analysis`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -72,7 +71,9 @@ pub fn command_analysis(ds: &EnrichedDataset) -> CommandAnalysis {
         if r.kind != "user" || r.has_tool_result {
             continue;
         }
-        let is_int = is_interrupt_text(&r.content);
+        // Precomputed from the full text at parse time — under `Detail::Lean`
+        // `content` is only the key's 64-char prefix.
+        let is_int = r.content_is_interrupt;
 
         let key = interaction_key(r);
         let (tc, steps) = match ix_lut.get(key.as_str()) {
@@ -117,11 +118,11 @@ fn scan_forward(ordered: &[&Record], idx: usize) -> (i64, i64) {
 /// `aggregator._next_is_interrupt`.
 fn next_is_interrupt(ordered: &[&Record], idx: usize) -> bool {
     for nxt in &ordered[idx + 1..] {
-        if nxt.kind == "assistant" && py_strip(&nxt.content) == INTERRUPT_API {
+        if nxt.kind == "assistant" && nxt.content_is_api_abort {
             return true;
         }
         if nxt.kind == "user" && !nxt.has_tool_result {
-            return is_interrupt_text(&nxt.content);
+            return nxt.content_is_interrupt;
         }
     }
     false
