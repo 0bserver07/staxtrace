@@ -1,0 +1,57 @@
+{
+  "agent": "codex",
+  "version": 2,
+  "detect_dirs": [
+    "~/.codex"
+  ],
+  "checks": [
+    {
+      "id": "codex.analytics_enabled",
+      "file": "~/.codex/config.toml",
+      "format": "toml",
+      "key": "analytics.enabled",
+      "uploading_when": [
+        true
+      ],
+      "safe_when": [
+        false
+      ],
+      "at_risk_when_unset": true,
+      "title": "Codex CLI sends usage and health analytics to OpenAI (on unless you turn it off)",
+      "veto": "set [analytics] enabled = false in ~/.codex/config.toml",
+      "severity": "medium"
+    },
+    {
+      "id": "codex.otel_log_user_prompt",
+      "file": "~/.codex/config.toml",
+      "format": "toml",
+      "key": "otel.log_user_prompt",
+      "uploading_when": [
+        true
+      ],
+      "safe_when": [
+        false
+      ],
+      "at_risk_when_unset": false,
+      "title": "Codex OTel export includes raw prompt text (redacted by default)",
+      "veto": "set [otel] log_user_prompt = false in ~/.codex/config.toml",
+      "severity": "high"
+    },
+    {
+      "id": "codex.update_check",
+      "file": "~/.codex/config.toml",
+      "format": "toml",
+      "key": "check_for_update_on_startup",
+      "uploading_when": [
+        true
+      ],
+      "safe_when": [
+        false
+      ],
+      "at_risk_when_unset": false,
+      "title": "Codex phones home for a version check on every start",
+      "veto": "set check_for_update_on_startup = false in ~/.codex/config.toml",
+      "severity": "info"
+    }
+  ]
+}

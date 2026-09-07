@@ -11,9 +11,11 @@
 
 /// `stax ingest` — the PR/CI receiver group (`cli.py`'s `ingest`). Appended for
 /// the same lib.rs-law reason as `msg` above.
+mod advanced;
 mod analyze;
 mod anchor;
 mod ask;
+mod audit;
 mod backup;
 mod benchmark;
 mod cache;
@@ -70,6 +72,9 @@ mod import_history;
 // ── agent-remotes Phases 1+2 — appended at the tail, per the lib.rs law ──────
 mod observe;
 mod remote;
+// ── track1-reposition — appended at the tail, per the lib.rs law ─────────────
+mod audit_transcripts;
+mod doctor_install;
 
 use std::process::ExitCode;
 
@@ -182,8 +187,17 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Keyed, append-only campaign state that survives a context rotation.
+    #[command(hide = true)]
     Anchor(AnchorArgs),
+    /// Which coding agents can send your code or telemetry off-box — and the
+    /// exact line that stops each one (Spec 28, config audit).
+    Audit(crate::audit::AuditArgs),
+    /// What your coding agents cost you — dashboard-style summary over a date range.
+    Cost(ReportArgs),
+    /// Reconstruct what the model "saw" in SESSION_ID up to a --at seq (session replay).
+    Replay(ContextReplayArgs),
     /// Back up and restore session data from every registered coding agent.
+    #[command(hide = true)]
     Backup(BackupArgs),
     /// Which model wins for the kind of work you actually do.
     ///
@@ -192,16 +206,20 @@ pub enum Command {
     /// intervals and a ``confidence`` label, and says "insufficient evidence"
     /// rather than guess. Run any subcommand with ``--json`` for the stable,
     /// token-bounded agent-output envelope.
+    #[command(hide = true)]
     Benchmark(BenchmarkArgs),
     /// View or change persistent settings.
+    #[command(hide = true)]
     Cfg(CfgArgs),
     /// Clear cached data.  Use ``start --fresh`` for a clean boot.
     #[command(name = "clear-cache")]
+    #[command(hide = true)]
     ClearCache(ClearCacheArgs),
     /// Compare per-model metrics side-by-side over a window.
     ///
     /// Renders one row per model with sessions, calls, one-shot %, retry
     /// rate, cache hit %, $/call, $/session, and total $.
+    #[command(hide = true)]
     Compare(CompareArgs),
     /// The pre-`cfg` spelling, kept working and kept out of every listing.
     ///
@@ -212,6 +230,7 @@ pub enum Command {
     #[command(hide = true, about = "", long_about = None)]
     Config(ConfigArgs),
     /// Read staxtrace's own docs, offline from the installed package.
+    #[command(hide = true)]
     Docs(DocsArgs),
     /// Read-only health + delivery check of the local store.
     ///
@@ -229,6 +248,7 @@ pub enum Command {
     /// a multi-period rollup (today / last 7 days / last 30 days) so a JSON
     /// consumer never has to make three CLI calls. CSV always lays out
     /// one section per period in the same file, separated by a blank line.
+    #[command(hide = true)]
     Export(ExportArgs),
     /// List sessions where editing FILE led to a follow-up correction.
     ///
@@ -240,14 +260,17 @@ pub enum Command {
     /// (default 0.5) are filtered out. The companion of
     /// ``find-sessions-where-action-worked``: use this to learn why an edit
     /// went wrong, that one to learn how a successful change was done.
+    #[command(hide = true)]
     FindFailureModesForFile(FailureModesArgs),
     /// List sessions whose project root is PATH or any ancestor of PATH.
     ///
     /// Useful when an agent is working in /a/b/c and wants to know what
     /// has happened in the project rooted at /a/b. The match is
     /// ancestor-only — projects rooted *below* PATH do not match.
+    #[command(hide = true)]
     FindSessionsInPath(InPathArgs),
     /// List sessions where FILE shows up in tool calls or message text.
+    #[command(hide = true)]
     FindSessionsTouchingFile(TouchingFileArgs),
     /// List sessions where ACTION was performed and the next user turn confirmed it worked.
     ///
@@ -261,16 +284,20 @@ pub enum Command {
     /// in [0.0, 1.0]; rows below ``--min-confidence`` (default 0.5) are
     /// filtered out. Pair with ``find-failure-modes-for-file`` to see where
     /// an edit went wrong.
+    #[command(hide = true)]
     FindSessionsWhereActionWorked(ActionWorkedArgs),
     /// Manage the staxtrace agent-discovery snippet in CLAUDE.md / AGENTS.md.
+    #[command(hide = true)]
     Guide(GuideArgs),
     /// Manage opt-in Claude Code lifecycle hooks (hybrid capture).
+    #[command(hide = true)]
     Hooks(HooksArgs),
     /// Start the dashboard (alias for ``start``).
     ///
     /// With ``--install-skills``, copies the three shipped Claude Code
     /// ``SKILL.md`` files into ``~/.claude/skills/`` (or ``--skills-dest``)
     /// before starting the dashboard. See ``docs/skills.md``.
+    #[command(hide = true)]
     Init(InitArgs),
     /// Ask the local store what past sessions already know.
     ///
@@ -283,9 +310,11 @@ pub enum Command {
     /// ``--since``, ``--limit`` and ``--context-budget``. ``--project``
     /// defaults to the current directory's project when staxtrace
     /// recognises it, so these commands Just Work when run inside a repo.
+    #[command(hide = true)]
     Memory(MemoryArgs),
     /// Estimate the per-session context tax (system prompt + MCP + skills + memory).
     #[command(name = "context-budget")]
+    #[command(hide = true)]
     ContextBudget(ContextBudgetArgs),
     /// Reconstruct what the model "saw" in SESSION_ID up to a --at seq.
     ///
@@ -295,8 +324,10 @@ pub enum Command {
     /// never an error. MVP semantics = the session's message sequence up to --at
     /// (harness-side context eviction is a future refinement).
     #[command(name = "context-replay")]
+    #[command(hide = true)]
     ContextReplay(ContextReplayArgs),
     /// This month's usage.
+    #[command(hide = true)]
     Month(PeriodArgs),
     /// Find wasted spend: looped Q&A pairs plus seven structural waste patterns.
     ///
@@ -305,15 +336,19 @@ pub enum Command {
     /// detected from filesystem state and tool-call history (bloated
     /// CLAUDE.md, unused MCP servers, ghost agents, junk reads, cache
     /// thrash, oversized bash output, exploration-only sessions).
+    #[command(hide = true)]
     Optimize(OptimizeArgs),
     /// Manage and inspect a monthly plan budget (Claude Pro, Cursor Pro, custom).
+    #[command(hide = true)]
     Plan(PlanArgs),
     /// Proactive recommendations mined from your local session store.
     ///
     /// Recommendations are read-only — accepting one is always a separate
     /// explicit step (e.g. ``stax skills generate --pattern <id>``).
+    #[command(hide = true)]
     Recommend(RecommendArgs),
     /// Dashboard-style summary over a date range.
+    #[command(hide = true)]
     Report(ReportArgs),
     /// Session/resume ids for every coding agent under PATH (default: cwd).
     ///
@@ -324,45 +359,59 @@ pub enum Command {
     /// and giving a workspace folder lists every project underneath. Read-only;
     /// agents whose CLI has no known resume command still list their session
     /// ids.
+    #[command(hide = true)]
     Resume(ResumeArgs),
     /// Surface "this file has caused N reverts in M days" before editing it.
     ///
     /// Read-only aggregator over the v0.7.2 outcome heuristic. No new
     /// schema; counts are computed from existing ``messages`` / ``sessions``
     /// rows on each call.
+    #[command(hide = true)]
     Risk(RiskArgs),
     /// Substring-search QUERY across past message content; return matching
     /// sessions.
+    #[command(hide = true)]
     SearchPastDecisions(PastDecisionsArgs),
     /// Generate / list / clean project-specific Claude Code skills.
     ///
     /// These are mined from your local session store — never from CLAUDE.md
     /// or memory — and are always project-scoped unless you ask otherwise.
+    #[command(hide = true)]
     Skills(SkillsArgs),
     /// Launch the staxtrace dashboard.
     Start(StartArgs),
     /// Compact one-liner: today + month cost and message counts.
+    #[command(hide = true)]
     Status(StatusArgs),
     /// Open the store read-only and print its schema version and row counts.
+    #[command(hide = true)]
     Store(StoreArgs),
     /// Encrypted, bring-your-own-bucket backup of your analytics aggregates
     /// (opt-in).
+    #[command(hide = true)]
     Sync(SyncArgs),
     /// Today's usage.
+    #[command(hide = true)]
     Today(PeriodArgs),
     /// Yield analysis: productive vs reverted vs abandoned sessions.
     #[command(name = "yield")]
+    #[command(hide = true)]
     Yield(YieldArgs),
     /// Inspect git worktrees: owner project, cost, prune safety (read-only).
+    #[command(hide = true)]
     Worktrees(WorktreesArgs),
     // ── T2v3 (this leg) — appended at the tail, never interleaved ────────────
     /// Inspect / maintain the discovery citation-feedback telemetry.
+    #[command(hide = true)]
     Discovery(DiscoveryArgs),
     /// Run the ETL pipeline (raw messages → events → marts).
+    #[command(hide = true)]
     Etl(EtlArgs),
     /// Inspect model pricing health (read-only).
+    #[command(hide = true)]
     Pricing(PricingArgs),
     /// Rebuild the session store from scratch.
+    #[command(hide = true)]
     Reindex(ReindexArgs),
     // ── TELEPHONE (this leg) — appended at the tail, never interleaved ───────
     /// Agent telephone — leave word for another machine's agents (and read
@@ -373,6 +422,7 @@ pub enum Command {
     /// recipient's injection hooks surface unseen messages into the next live
     /// agent turn (UserPromptSubmit / PreToolUse), exactly once. No broker, no
     /// daemon.
+    #[command(hide = true)]
     Msg(MsgArgs),
     /// Pull PR / CI data into the local store (REST backfill + webhook
     /// receiver).
@@ -396,12 +446,14 @@ pub enum Command {
         about = "Per-session static-analysis pass — complexity / lint / type-completeness deltas.",
         long_about = None
     )]
+    #[command(hide = true)]
     Analyze(crate::analyze::AnalyzeArgs),
     /// PR / CI ingest group.
     #[command(
         about = "Pull PR / CI data into the local store (REST backfill + webhook receiver).",
         long_about = None
     )]
+    #[command(hide = true)]
     Ingest(IngestArgs),
     // ── RS-8-101 (the import leg) — appended at the tail ────────────────────
     /// Import external agent history via a user-supplied export command.
@@ -419,6 +471,7 @@ pub enum Command {
     /// unchanged export is an idempotent no-op (content-addressed ids).
     ///
     /// Also available as ``stax import``.
+    #[command(hide = true)]
     Import(ImportArgs),
     // ── agent-remotes Phases 1+2 — appended at the tail ─────────────────────
     /// Manage the remote address book: other machines' datasets, by name.
@@ -428,6 +481,7 @@ pub enum Command {
     /// the same read-only verb where that data lives; `stax observe NAME`
     /// tails its most recent session. Auth is ssh's (keys, agent, tailnet);
     /// nothing here stores a credential.
+    #[command(hide = true)]
     Remote(remote::RemoteArgs),
     /// Watch another machine's most recent agent session, live.
     ///
@@ -435,7 +489,10 @@ pub enum Command {
     /// versioned `staxtrace.observe/1` envelope on the wire) and renders
     /// a log tail. `--once` fetches a single batch; `--json` passes envelopes
     /// through verbatim.
+    #[command(hide = true)]
     Observe(observe::ObserveArgs),
+    /// Every verb, including the ones this help hides.
+    Advanced(crate::advanced::AdvancedArgs),
 }
 
 /// Parse this process's arguments and run the requested command.
@@ -459,6 +516,10 @@ pub fn run() -> Result<ExitCode> {
 pub fn dispatch(cli: &Cli) -> Result<ExitCode> {
     let code = match &cli.command {
         Command::Anchor(args) => run_anchor(args).map(|()| ExitCode::SUCCESS)?,
+        Command::Audit(args) => crate::audit::run_audit(args)?.emit(),
+        Command::Cost(args) => run_report(args)?.emit(),
+        Command::Replay(args) => run_context_replay(args)?.emit(),
+        Command::Advanced(args) => crate::advanced::run_advanced(args)?,
         Command::Backup(args) => run_backup(args)?.emit(),
         Command::Benchmark(args) => run_benchmark(args)?.emit(),
         Command::Cfg(args) => run_cfg(args)?.emit(),

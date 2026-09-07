@@ -4,6 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+repository = "https://github.com/0bserver07/staxtrace"
+
+# cargo-binstall resolves prebuilt release artifacts instead of compiling:
+#   cargo binstall --git https://github.com/0bserver07/staxtrace stax-cli
+# The templates must keep matching the release workflow's artifact naming
+# (staxtrace-v<tag>-<triple>.tar.gz with a versioned top-level directory).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/staxtrace-v{ version }-{ target }.tar.gz"
+bin-dir = "staxtrace-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
 
 [[bin]]
 name = "stax"
@@ -92,3 +102,7 @@ regex = "1.12"
 # reference CLI.
 sha2 = "0.10.9"
 ureq = { version = "2", default-features = false, features = ["tls"] }
+
+# Spec 28's D1 engine — `stax audit`.
+[dependencies.stax-audit]
+path = "../stax-audit"

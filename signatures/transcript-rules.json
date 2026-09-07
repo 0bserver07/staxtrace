@@ -1,0 +1,194 @@
+{
+  "version": 3,
+  "allow_hosts": [
+    "localhost",
+    "127.0.0.1",
+    "0.0.0.0",
+    "::1",
+    "[::1]",
+    "host.docker.internal"
+  ],
+  "secret_path_markers": [
+    ".env",
+    "id_rsa",
+    "id_ed25519",
+    "credentials",
+    ".aws/",
+    ".ssh/",
+    ".npmrc",
+    ".pypirc",
+    "secrets"
+  ],
+  "secret_window": 6,
+  "families": [
+    {
+      "id": "d3.network_write",
+      "kind": "program",
+      "programs": [
+        "curl",
+        "wget"
+      ],
+      "argv_any": [
+        "-T",
+        "--upload-file",
+        "-F",
+        "--form",
+        "-d",
+        "--data",
+        "--data-binary",
+        "--data-raw",
+        "--data-urlencode",
+        "--data-ascii",
+        "--post-file",
+        "--post-data",
+        "--body-file",
+        "--body-data"
+      ],
+      "requires_remote": true,
+      "severity": "high",
+      "title": "An agent uploaded local content over HTTP",
+      "veto": "review the session, then rotate anything the payload contained",
+      "requires_file_payload": true
+    },
+    {
+      "id": "d3.network_write_http",
+      "kind": "program",
+      "programs": [
+        "http",
+        "https",
+        "xh",
+        "httpie"
+      ],
+      "argv_any": [
+        "POST",
+        "PUT",
+        "PATCH",
+        "--form",
+        "-f",
+        "--multipart",
+        "--raw"
+      ],
+      "requires_remote": true,
+      "severity": "high",
+      "title": "An agent sent a request body over HTTP (httpie)",
+      "veto": "review the session, then rotate anything the payload contained",
+      "requires_file_payload": true
+    },
+    {
+      "id": "d3.remote_copy",
+      "kind": "program",
+      "programs": [
+        "scp",
+        "rsync",
+        "sftp"
+      ],
+      "argv_any": [],
+      "requires_remote": true,
+      "severity": "high",
+      "title": "An agent copied files to a remote host",
+      "veto": "review the session; if the host is yours, allow-list it (--allow-host)"
+    },
+    {
+      "id": "d3.tunnel",
+      "kind": "program",
+      "programs": [
+        "nc",
+        "ncat",
+        "netcat",
+        "socat"
+      ],
+      "argv_any": [],
+      "requires_remote": true,
+      "severity": "high",
+      "title": "An agent opened a raw socket to a remote host",
+      "veto": "review the session; raw sockets bypass every HTTP log you have",
+      "requires_payload_source": true
+    },
+    {
+      "id": "d3.git_push_new_remote",
+      "kind": "gitpush",
+      "severity": "medium",
+      "title": "An agent pushed this repository to a remote it added itself",
+      "veto": "review the session; if the host is yours, allow-list it (--allow-host)"
+    },
+    {
+      "id": "d3.cloud_upload",
+      "kind": "phrase",
+      "phrases": [
+        "aws s3 cp",
+        "aws s3 sync",
+        "aws s3 mv",
+        "gcloud storage cp",
+        "gsutil cp",
+        "az storage blob upload",
+        "gh gist create",
+        "rclone copy",
+        "rclone sync",
+        "rclone move",
+        "b2 upload-file"
+      ],
+      "severity": "high",
+      "title": "An agent uploaded to cloud storage or a paste service",
+      "veto": "review the session; check the bucket/gist visibility"
+    },
+    {
+      "id": "d3.paste_host",
+      "kind": "host",
+      "programs": [
+        "curl",
+        "wget",
+        "http",
+        "https",
+        "xh"
+      ],
+      "hosts": [
+        "transfer.sh",
+        "0x0.st",
+        "file.io",
+        "pastebin.com",
+        "ix.io",
+        "termbin.com",
+        "bashupload.com",
+        "oshi.at",
+        "paste.rs",
+        "dpaste.org",
+        "hastebin.com"
+      ],
+      "severity": "high",
+      "title": "An agent sent data to a public paste/file-drop service",
+      "veto": "review the session; treat anything sent as public"
+    },
+    {
+      "id": "d3.encode_exfil",
+      "kind": "pipeline",
+      "left_any": [
+        "tar",
+        "gzip",
+        "bzip2",
+        "xz",
+        "zstd",
+        "zip",
+        "7z",
+        "base64",
+        "xxd",
+        "openssl"
+      ],
+      "right_any": [
+        "curl",
+        "wget",
+        "nc",
+        "ncat",
+        "netcat",
+        "socat",
+        "http",
+        "https",
+        "xh",
+        "ssh"
+      ],
+      "requires_remote": true,
+      "severity": "high",
+      "title": "An agent packed local files and piped them to the network",
+      "veto": "review the session; packed payloads hide what actually left"
+    }
+  ]
+}

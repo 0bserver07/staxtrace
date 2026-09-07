@@ -1,0 +1,11 @@
+EGRESS AUDIT — 2 of your 4 coding agents can upload your data
+
+  AGENT   FINDING                     SEVERITY  VETO
+  grok    Grok Build CLI can tarbal…  critical  set [telemetry] trace_upload = …
+          ↳ ~/.grok/config: k = v
+  gemini  Gemini CLI usage-statisti…  medium    set "usageStatisticsEnabled": f…
+          ↳ ~/.gemini/config: k = v
+  codex   codex detected, no verifi…  info      —
+          ↳ ~/.codex/config: k = v
+
+  3 findings · unknown ≠ safe (1 unknown, 0 artifacts not read) · vetoes are suggestions — staxtrace never edits your configs

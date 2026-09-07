@@ -87,6 +87,10 @@ pub struct DoctorArgs {
                 (GAP/DISK_GAP in the delivery scoreboard). For CI / pre-release gates."
     )]
     pub fail_on_gap: bool,
+    /// Verify the installation itself (binary, siblings, signatures, data
+    /// dir) instead of the store. Additive: the store report is parity-pinned.
+    #[arg(long)]
+    pub install: bool,
 }
 
 // ── health ───────────────────────────────────────────────────────────────────
@@ -780,6 +784,9 @@ pub fn render_doctor_json(health: &Health, delivery: &Delivery) -> String {
 /// reaches the same table through a module-level import, so a broken table is a
 /// hard failure there too.
 pub fn run_doctor(args: &DoctorArgs) -> Result<Output> {
+    if args.install {
+        return crate::doctor_install::run_install_checks();
+    }
     let store_path = doctor_store_path();
     let health = run_store_health_checks(&store_path);
 

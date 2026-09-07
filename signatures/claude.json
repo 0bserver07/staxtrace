@@ -1,0 +1,134 @@
+{
+  "agent": "claude",
+  "version": 2,
+  "detect_dirs": [
+    "~/.claude"
+  ],
+  "checks": [
+    {
+      "id": "claude.usage_metrics",
+      "file": "~/.claude/settings.json",
+      "format": "json",
+      "key": "env.DISABLE_TELEMETRY",
+      "env_var": "DISABLE_TELEMETRY",
+      "uploading_when": [],
+      "safe_when": [],
+      "safe_when_set": true,
+      "at_risk_when_unset": true,
+      "alt_vetoes": [
+        {
+          "key": "env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+          "env_var": "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+          "safe_when_set": true
+        }
+      ],
+      "title": "Claude Code sends usage metrics to Anthropic (on by default; never code, prompts or file paths)",
+      "veto": "set \"DISABLE_TELEMETRY\": \"1\" in the env block of ~/.claude/settings.json",
+      "severity": "low"
+    },
+    {
+      "id": "claude.error_reports",
+      "file": "~/.claude/settings.json",
+      "format": "json",
+      "key": "env.DISABLE_ERROR_REPORTING",
+      "env_var": "DISABLE_ERROR_REPORTING",
+      "uploading_when": [],
+      "safe_when": [],
+      "safe_when_set": true,
+      "at_risk_when_unset": true,
+      "alt_vetoes": [
+        {
+          "key": "env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+          "env_var": "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+          "safe_when_set": true
+        }
+      ],
+      "title": "Claude Code sends error reports (stack traces, secrets redacted) to a third-party tracker — on for Pro/Max sign-ins",
+      "veto": "set \"DISABLE_ERROR_REPORTING\": \"1\" in the env block of ~/.claude/settings.json",
+      "severity": "low"
+    },
+    {
+      "id": "claude.transcript_survey",
+      "file": "~/.claude/settings.json",
+      "format": "json",
+      "key": "env.CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY",
+      "env_var": "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY",
+      "uploading_when": [],
+      "safe_when": [
+        1,
+        "1",
+        true,
+        "true"
+      ],
+      "at_risk_when_unset": true,
+      "alt_vetoes": [
+        {
+          "key": "env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+          "env_var": "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+          "safe_when_set": true
+        },
+        {
+          "key": "env.DISABLE_TELEMETRY",
+          "env_var": "DISABLE_TELEMETRY",
+          "safe_when_set": true
+        },
+        {
+          "key": "env.DO_NOT_TRACK",
+          "env_var": "DO_NOT_TRACK",
+          "safe_when_set": true
+        }
+      ],
+      "title": "Claude Code may offer to upload a session transcript, source code included, after a rating prompt (sent only if you answer Yes)",
+      "veto": "set \"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY\": \"1\" in the env block of ~/.claude/settings.json",
+      "severity": "low"
+    },
+    {
+      "id": "claude.otel_telemetry",
+      "file": "~/.claude/settings.json",
+      "format": "json",
+      "key": "env.CLAUDE_CODE_ENABLE_TELEMETRY",
+      "env_var": "CLAUDE_CODE_ENABLE_TELEMETRY",
+      "uploading_when": [
+        true,
+        1,
+        "1",
+        "true"
+      ],
+      "safe_when": [
+        false,
+        0,
+        "0",
+        "false",
+        ""
+      ],
+      "at_risk_when_unset": false,
+      "title": "Claude Code OpenTelemetry export is on — metrics and events go to the OTLP endpoint you configured (opt-in, default off)",
+      "veto": "remove CLAUDE_CODE_ENABLE_TELEMETRY from the env block in ~/.claude/settings.json and from your shell",
+      "severity": "medium"
+    },
+    {
+      "id": "claude.otel_user_prompts",
+      "file": "~/.claude/settings.json",
+      "format": "json",
+      "key": "env.OTEL_LOG_USER_PROMPTS",
+      "env_var": "OTEL_LOG_USER_PROMPTS",
+      "uploading_when": [
+        true,
+        1,
+        "1",
+        "true"
+      ],
+      "safe_when": [
+        false,
+        0,
+        "0",
+        "false",
+        ""
+      ],
+      "at_risk_when_unset": false,
+      "title": "Claude Code OpenTelemetry logs include your prompt text (OTEL_LOG_USER_PROMPTS=1; redacted by default)",
+      "veto": "remove OTEL_LOG_USER_PROMPTS from the env block in ~/.claude/settings.json and from your shell",
+      "severity": "high"
+    }
+  ]
+}

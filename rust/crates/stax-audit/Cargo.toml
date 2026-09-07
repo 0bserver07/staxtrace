@@ -1,0 +1,23 @@
+[package]
+name = "stax-audit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Crate-local on purpose (the notify precedent in stax-etl): serde-derive is
+# needed only here, for the signature catalog. The catalog itself is JSON, not
+# YAML — Spec 28 §6 models it on adapters/capabilities.json (serde_json is
+# already a workspace dep).
+#
+# `toml` is the one reader this crate takes from outside: the `toml` crate was
+# already in the workspace graph (via find-crate) at this exact version, so it
+# adds no crate to the lock. It replaces a hand-rolled "toml-lite" subset that
+# could not read dotted keys, inline tables, quoted keys or arrays of tables —
+# and therefore reported vetoes that WERE set as at-risk. For a security audit
+# a parser dependency is cheaper than a wrong-direction finding.
+[dependencies]
+anyhow.workspace = true
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json.workspace = true
+toml = "0.5"

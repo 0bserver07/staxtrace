@@ -40,6 +40,15 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
+          # Static musl builds run on ANY Linux — the gnu builds above need
+          # glibc >= the build runner's (2.39 on ubuntu-24.04), which killed
+          # v1.0.0 on Ubuntu <= 23.10 and Debian 12. install.sh prefers musl
+          # and falls back to gnu for old releases; the gnu pair stays for
+          # link-compat until the tap and binstall templates flip over.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
         with:
@@ -48,6 +57,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -105,3 +118,48 @@ jobs:
           files: |
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.checksum }}
+
+  # Bump Formula/staxtrace.rb in 0bserver07/homebrew-tap to this release.
+  # Needs a TAP_PUSH_TOKEN secret (fine-grained PAT, contents:write on the tap
+  # repo). Absent secret = loud skip, never a broken half-push. The formula's
+  # Linux URLs still point at the gnu triples; flipping them to musl is a
+  # one-time formula edit once a musl-carrying release exists.
+  tap-bump:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: bump tap formula
+        env:
+          TAP_PUSH_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if [ -z "$TAP_PUSH_TOKEN" ]; then
+            echo "::notice::TAP_PUSH_TOKEN not set — tap not bumped; update Formula/staxtrace.rb by hand for $TAG"
+            exit 0
+          fi
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          git clone "https://x-access-token:${TAP_PUSH_TOKEN}@github.com/0bserver07/homebrew-tap.git" tap
+          cd tap
+          sha_for() {
+            curl -fsSL "https://github.com/0bserver07/staxtrace/releases/download/${TAG}/staxtrace-${TAG}-$1.tar.gz.sha256" | awk '{print $1}'
+          }
+          # Rewrite version, then each triple's sha256 on the line after its url.
+          sed -i "s/^  version \".*\"/  version \"${VERSION}\"/" Formula/staxtrace.rb
+          for triple in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            SHA="$(sha_for "$triple")"
+            python3 - "$triple" "$SHA" <<'PY'
+          import re, sys
+          triple, sha = sys.argv[1], sys.argv[2]
+          path = "Formula/staxtrace.rb"
+          text = open(path).read()
+          pattern = re.compile(r'(-%s\.tar\.gz"\n\s+sha256 ")[0-9a-f]{64}(")' % re.escape(triple))
+          text, count = pattern.subn(lambda m: m.group(1) + sha + m.group(2), text)
+          assert count == 1, f"{triple}: expected exactly one sha line, found {count}"
+          open(path, "w").write(text)
+          PY
+          done
+          git config user.name "staxtrace-release"
+          git config user.email "release@users.noreply.github.com"
+          git commit -am "staxtrace ${VERSION}"
+          git push

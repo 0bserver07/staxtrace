@@ -1,0 +1,5 @@
+EGRESS AUDIT — 0 of your 1 coding agents can upload your data
+
+  nothing configured to upload — 1 agents detected, 1 vetoes verified present
+
+  0 findings · unknown ≠ safe (0 unknown, 0 artifacts not read) · vetoes are suggestions — staxtrace never edits your configs

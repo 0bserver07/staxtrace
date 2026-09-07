@@ -2062,6 +2062,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "stax-audit"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "stax-cli"
 version = "1.0.0"
 dependencies = [
@@ -2072,6 +2082,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "stax-adapters",
+ "stax-audit",
  "stax-core",
  "stax-etl",
  "stax-hooks",

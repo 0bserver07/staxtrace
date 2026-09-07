@@ -1,0 +1,6 @@
+{
+  "agent": "cursor",
+  "version": 1,
+  "detect_dirs": ["~/.cursor", "~/.config/Cursor", "~/Library/Application Support/Cursor"],
+  "pending": "Privacy Mode is account-side and server-enforced — Cursor states it is 'tied to your account, not to a specific app', so NO local file can tell you whether your code is being retained or trained on. Check it at cursor.com/dashboard → Privacy. (`telemetry.telemetryLevel` exists in the VS Code-inherited settings but Cursor documents no commitment to honor it, so staxtrace will not claim it as a veto.)"
+}

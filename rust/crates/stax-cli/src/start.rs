@@ -490,7 +490,16 @@ fn boot(
     // store somebody else had migrated.
     apply_schema_at_boot(&store_path)?;
 
-    let mut command = std::process::Command::new(server_binary());
+    let server = server_binary();
+    if !server.is_absolute() && !on_path(&server) {
+        anyhow::bail!(
+            "stax-server is neither next to this binary nor on PATH. The brew tap and \
+             install.sh ship all three binaries side by side — a partial install (e.g. \
+             `cargo install` of one crate) is the usual cause. `stax doctor --install` \
+             shows what's missing."
+        );
+    }
+    let mut command = std::process::Command::new(server);
     command
         .arg("--host")
         .arg(addr.ip().to_string())
@@ -635,6 +644,14 @@ fn resident_watcher(
 /// Next to this executable is the answer for every layout the campaign has —
 /// `target/<profile>/` in development, one install directory in a package — and
 /// the bare name on `$PATH` is the fallback rather than a guess at a prefix.
+/// Is a bare binary name resolvable through `$PATH`?
+fn on_path(name: &Path) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
+}
+
 fn server_binary() -> PathBuf {
     let sibling = std::env::current_exe()
         .ok()

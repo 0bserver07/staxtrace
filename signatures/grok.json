@@ -1,0 +1,57 @@
+{
+  "agent": "grok",
+  "version": 2,
+  "detect_dirs": [
+    "~/.grok"
+  ],
+  "checks": [
+    {
+      "id": "grok.trace_upload",
+      "file": "~/.grok/config.toml",
+      "format": "toml",
+      "key": "telemetry.trace_upload",
+      "uploading_when": [
+        true
+      ],
+      "safe_when": [
+        false
+      ],
+      "at_risk_when_unset": true,
+      "title": "Grok Build CLI can tarball this repo into xAI's trace bucket",
+      "veto": "set [telemetry] trace_upload = false in ~/.grok/config.toml",
+      "severity": "critical"
+    },
+    {
+      "id": "grok.disable_codebase_upload",
+      "file": "~/.grok/config.toml",
+      "format": "toml",
+      "key": "telemetry.disable_codebase_upload",
+      "uploading_when": [
+        false
+      ],
+      "safe_when": [
+        true
+      ],
+      "at_risk_when_unset": true,
+      "title": "Codebase upload has no local veto (remote flag decides)",
+      "veto": "set [telemetry] disable_codebase_upload = true in ~/.grok/config.toml",
+      "severity": "critical"
+    },
+    {
+      "id": "grok.features_telemetry",
+      "file": "~/.grok/config.toml",
+      "format": "toml",
+      "key": "features.telemetry",
+      "uploading_when": [
+        true
+      ],
+      "safe_when": [
+        false
+      ],
+      "at_risk_when_unset": false,
+      "title": "Grok telemetry feature flag is on",
+      "veto": "set [features] telemetry = false in ~/.grok/config.toml",
+      "severity": "medium"
+    }
+  ]
+}
