@@ -308,6 +308,50 @@ pub fn count_interaction_dims(parsed: Vec<(&DimRow, Value)>) -> InteractionDims 
 
 #[cfg(test)]
 mod tests {
+
+    /// Not a test: a measurement harness for the per-tick peak. Run the
+    /// release test binary under `/usr/bin/time -l` (macOS) or
+    /// `/usr/bin/time -v` (Linux) with `STAX_DIMS_BENCH_STORE` pointing at a
+    /// COPY of a real store and `STAX_DIMS_BENCH_PROJECT` naming a slug; the
+    /// max RSS it prints is the number this module's design is judged on.
+    #[test]
+    #[ignore]
+    fn bench_refresh_message_dims_on_a_real_store() {
+        let Ok(store) = std::env::var("STAX_DIMS_BENCH_STORE") else {
+            return;
+        };
+        let slug = std::env::var("STAX_DIMS_BENCH_PROJECT").expect("STAX_DIMS_BENCH_PROJECT");
+        let conn = Connection::open(&store).expect("open the copied store");
+        // `ALL` refreshes every project — the parity oracle: dump
+        // `project_mart` before and after a change and diff the rows.
+        let ids: Vec<i64> = if slug == "ALL" {
+            let mut stmt = conn.prepare("SELECT id FROM projects ORDER BY id").unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        } else {
+            vec![
+                conn.query_row("SELECT id FROM projects WHERE slug = ?", [&slug], |r| r.get(0))
+                    .expect("project slug exists"),
+            ]
+        };
+        let messages: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages m JOIN sessions s ON s.id = m.session_fk WHERE s.project_id IN (SELECT id FROM projects WHERE ? = 'ALL' OR slug = ?)",
+                [&slug, &slug],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let started = std::time::Instant::now();
+        refresh_message_dims(&conn, &ids).expect("refresh");
+        eprintln!(
+            "dims bench: {slug} projects={} messages={messages} elapsed={:.1?}",
+            ids.len(),
+            started.elapsed()
+        );
+    }
+
     use super::*;
 
     fn row(raw: &str, ts: &str) -> DimRow {
