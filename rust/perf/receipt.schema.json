@@ -1,0 +1,93 @@
+{
+  "title": "StaxTrace performance receipt",
+  "type": "object",
+  "required": [
+    "schema", "run_id", "policy_digest", "scenario", "profile", "runner",
+    "fixture", "samples", "throughput_per_second", "setup_wall_seconds",
+    "copy_wall_seconds", "timed_wall_seconds", "scenario_wall_seconds",
+    "timeout_seconds", "resources", "guard", "status"
+  ],
+  "properties": {
+    "schema": {"const": "staxtrace.performance-receipt"},
+    "run_id": {"type": "string", "pattern": "^[a-f0-9]{32}$"},
+    "policy_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "scenario": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+    "profile": {"const": "release"},
+    "runner": {
+      "type": "object",
+      "required": ["os", "architecture", "runner_class", "toolchain", "key"],
+      "properties": {
+        "os": {"type": "string", "minLength": 1},
+        "architecture": {"type": "string", "minLength": 1},
+        "runner_class": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+$"},
+        "toolchain": {"type": "string", "minLength": 1},
+        "key": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "fixture": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"pattern": "^[a-z][a-z0-9_]{0,63}$"},
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    },
+    "samples": {
+      "type": "object",
+      "required": ["count", "p50_ms", "p95_ms", "p99_ms"],
+      "properties": {
+        "count": {"type": "integer", "minimum": 1},
+        "p50_ms": {"type": "number", "minimum": 0},
+        "p95_ms": {"type": "number", "minimum": 0},
+        "p99_ms": {"type": "number", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "throughput_per_second": {"type": ["number", "null"], "minimum": 0},
+    "setup_wall_seconds": {"type": "number", "minimum": 0},
+    "copy_wall_seconds": {"type": "number", "minimum": 0},
+    "timed_wall_seconds": {"type": "number", "exclusiveMinimum": 0},
+    "scenario_wall_seconds": {"type": "number", "exclusiveMinimum": 0},
+    "timeout_seconds": {"type": "integer", "minimum": 1},
+    "resources": {
+      "type": "object",
+      "required": [
+        "measurement_mode", "peak_rss_bytes", "peak_open_files",
+        "child_peak_rss_bytes", "child_peak_open_files",
+        "rss_sample_count", "open_file_sample_count", "child_process_sample_count",
+        "observer_wall_seconds", "observer_wall_fraction",
+        "observer_wall_seconds_limit", "peak_rss_limit_bytes", "open_file_limit"
+      ],
+      "properties": {
+        "measurement_mode": {"enum": ["edge", "continuous"]},
+        "peak_rss_bytes": {"type": "integer", "minimum": 1},
+        "peak_open_files": {"type": "integer", "minimum": 1},
+        "child_peak_rss_bytes": {"type": "integer", "minimum": 0},
+        "child_peak_open_files": {"type": "integer", "minimum": 0},
+        "rss_sample_count": {"type": "integer", "minimum": 2},
+        "open_file_sample_count": {"type": "integer", "minimum": 2},
+        "child_process_sample_count": {"type": "integer", "minimum": 0},
+        "observer_wall_seconds": {"type": "number", "minimum": 0},
+        "observer_wall_fraction": {"type": "number", "minimum": 0},
+        "observer_wall_seconds_limit": {"type": "number", "exclusiveMinimum": 0},
+        "peak_rss_limit_bytes": {"type": "integer", "minimum": 1},
+        "open_file_limit": {"type": "integer", "minimum": 1}
+      },
+      "additionalProperties": false
+    },
+    "guard": {
+      "type": "object",
+      "required": ["metric", "comparison", "limit", "actual", "errors", "passed"],
+      "properties": {
+        "metric": {"enum": ["p99_ms", "throughput_per_second", "reader_p99_ms"]},
+        "comparison": {"enum": ["at_most", "at_least"]},
+        "limit": {"type": "number", "minimum": 0},
+        "actual": {"type": "number", "minimum": 0},
+        "errors": {"type": ["integer", "null"], "minimum": 0},
+        "passed": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "status": {"enum": ["pass", "fail"]}
+  },
+  "additionalProperties": false
+}

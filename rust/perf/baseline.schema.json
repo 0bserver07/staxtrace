@@ -1,0 +1,54 @@
+{
+  "title": "StaxTrace performance baseline",
+  "type": "object",
+  "required": [
+    "schema", "policy_digest", "runner", "clean_run_count", "run_ids",
+    "suite_digests", "source_suites", "scenarios", "status"
+  ],
+  "properties": {
+    "schema": {"const": "staxtrace.performance-baseline"},
+    "policy_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "runner": {
+      "type": "object",
+      "required": ["os", "architecture", "runner_class", "toolchain", "key"],
+      "properties": {
+        "os": {"type": "string", "minLength": 1},
+        "architecture": {"type": "string", "minLength": 1},
+        "runner_class": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+$"},
+        "toolchain": {"type": "string", "minLength": 1},
+        "key": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "clean_run_count": {"type": "integer", "minimum": 1},
+    "run_ids": {
+      "type": "array", "minItems": 3, "maxItems": 3, "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-f0-9]{32}$"}
+    },
+    "suite_digests": {
+      "type": "array", "minItems": 3, "maxItems": 3, "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+    },
+    "source_suites": {
+      "type": "array", "minItems": 3, "maxItems": 3, "uniqueItems": true,
+      "items": {"$ref": "suite.schema.json"}
+    },
+    "scenarios": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "required": ["p99_ms", "peak_rss_bytes", "peak_open_files", "throughput_per_second"],
+        "properties": {
+          "p99_ms": {"type": "number", "minimum": 0},
+          "peak_rss_bytes": {"type": "number", "minimum": 1},
+          "peak_open_files": {"type": "number", "minimum": 1},
+          "throughput_per_second": {"type": ["number", "null"], "minimum": 0}
+        },
+        "additionalProperties": false
+      }
+    },
+    "status": {"const": "pass"}
+  },
+  "additionalProperties": false
+}

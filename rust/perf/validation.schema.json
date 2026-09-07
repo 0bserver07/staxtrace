@@ -1,0 +1,11 @@
+{
+  "title": "StaxTrace performance validation outcome",
+  "type": "object",
+  "required": ["schema", "artifact", "outcome"],
+  "properties": {
+    "schema": {"const": "staxtrace.performance-validation"},
+    "artifact": {"enum": ["suite", "baseline"]},
+    "outcome": {"enum": ["invalid", "incompatible", "valid", "comparable"]}
+  },
+  "additionalProperties": false
+}

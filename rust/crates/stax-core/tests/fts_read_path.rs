@@ -46,6 +46,17 @@ impl Drop for Scratch {
     }
 }
 
+/// A stable synthetic tree below the platform's canonical temporary root.
+/// The suffix need not exist: the production resolver canonicalizes the
+/// longest existing prefix and appends the rest lexically.
+fn fixture_path(relative: &str) -> String {
+    let root = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temporary root");
+    root.join("stax-fts-query-fixture")
+        .join(relative)
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Schema v030, trimmed to what discovery reads. `messages` is a UNION-ALL view
 /// over monthly partitions, as the real store's is.
 const STORE_SCHEMA: &str = "
@@ -86,18 +97,23 @@ const SID_C: &str = "cccccccc-3333-4333-8333-333333333333";
 
 /// Three sessions in one project.
 ///
-/// * A — says "cache" once, and *edits* `/home/dev/alpha/main.py`.
+/// * A — says "cache" once, and edits the fixture's `main.py`.
 /// * B — says "cache" three times across two messages, touches nothing.
-/// * C — mentions `/home/dev/alpha/main.py` in prose only, and the words
+/// * C — mentions that same path in prose only, and the words
 ///   `cache` and `lookup` non-adjacently (the phrase the `LIKE` path misses).
 fn store(scratch: &Scratch) -> Connection {
     let conn = Connection::open(scratch.join("store.db")).expect("store");
     conn.execute_batch(STORE_SCHEMA).expect("schema");
+    let project = fixture_path("alpha");
+    conn.execute(
+        "INSERT INTO projects
+           (id, provider, slug, path, display_name, first_seen, last_modified)
+         VALUES (1, 'claude', '-home-dev-alpha', ?1, 'alpha', 0, 0)",
+        [&project],
+    )
+    .expect("project");
     conn.execute_batch(&format!(
         r#"
-        INSERT INTO projects (id, provider, slug, path, display_name, first_seen, last_modified)
-        VALUES (1, 'claude', '-home-dev-alpha', NULL, 'alpha', 0, 0);
-
         INSERT INTO sessions (id, project_id, session_id, first_ts, last_ts, message_count)
         VALUES (1, 1, '{SID_A}', '2026-01-01T09:00:00+00:00', '2026-01-01T10:00:00+00:00', 3),
                (2, 1, '{SID_B}', '2026-01-02T09:00:00+00:00', '2026-01-02T10:00:00+00:00', 2),
@@ -113,20 +129,36 @@ fn store(scratch: &Scratch) -> Connection {
         VALUES
           (1, 1, 1, '2026-01-01T09:10:00+00:00', 'user',
            'we should cache the watermark', '[]'),
-          (2, 1, 2, '2026-01-01T09:20:00+00:00', 'assistant', '',
-           '[{{"name": "Edit", "input": {{"file_path": "/home/dev/alpha/main.py"}}}}]'),
           (3, 1, 3, '2026-01-01T09:30:00+00:00', 'user', 'that worked, thanks', '[]'),
 
           (4, 2, 1, '2026-01-02T09:10:00+00:00', 'user',
            'cache cache cache everywhere', '[]'),
           (5, 2, 2, '2026-01-02T09:20:00+00:00', 'user', 'the cache again', '[]'),
 
-          (6, 3, 1, '2026-01-03T09:10:00+00:00', 'user',
-           'the cache is consulted on every lookup in /home/dev/alpha/main.py', '[]'),
           (7, 3, 2, '2026-01-03T09:20:00+00:00', 'user', 'that worked, thanks', '[]');
         "#
     ))
     .expect("seed");
+    let main = fixture_path("alpha/main.py");
+    let tools = serde_json::to_string(&serde_json::json!([{
+        "name": "Edit",
+        "input": {"file_path": main}
+    }]))
+    .expect("tools JSON");
+    conn.execute(
+        "INSERT INTO messages_202601
+           (id, session_fk, seq, timestamp, role, content_text, tools_json)
+         VALUES (2, 1, 2, '2026-01-01T09:20:00+00:00', 'assistant', '', ?1)",
+        [tools],
+    )
+    .expect("edit row");
+    conn.execute(
+        "INSERT INTO messages_202601
+           (id, session_fk, seq, timestamp, role, content_text, tools_json)
+         VALUES (6, 3, 1, '2026-01-03T09:10:00+00:00', 'user', ?1, '[]')",
+        [format!("the cache is consulted on every lookup in {main}")],
+    )
+    .expect("prose row");
     conn
 }
 
@@ -163,6 +195,8 @@ fn index(scratch: &Scratch, rows: &[(&str, &str, &str, &str)]) -> LexicalIndex {
 
 /// The index mirroring the store's content — what a real `reindex` produces.
 fn mirrored_index(scratch: &Scratch) -> LexicalIndex {
+    let main = fixture_path("alpha/main.py");
+    let mention = format!("the cache is consulted on every lookup in {main}");
     index(
         scratch,
         &[
@@ -184,12 +218,7 @@ fn mirrored_index(scratch: &Scratch) -> LexicalIndex {
                 "the cache again",
                 "2026-01-02T09:20:00",
             ),
-            (
-                SID_C,
-                "-home-dev-alpha",
-                "the cache is consulted on every lookup in /home/dev/alpha/main.py",
-                "2026-01-03T09:10:00",
-            ),
+            (SID_C, "-home-dev-alpha", &mention, "2026-01-03T09:10:00"),
         ],
     )
 }
@@ -524,7 +553,7 @@ fn touching_file_ranks_the_exact_tool_half_ahead_of_content_mentions() {
     let matches = queries::find_sessions_touching_file_indexed(
         &conn,
         Some(&idx),
-        "/home/dev/alpha/main.py",
+        &fixture_path("alpha/main.py"),
         20_i64,
     )
     .expect("query");
@@ -545,7 +574,7 @@ fn the_content_half_is_skipped_once_the_exact_half_fills_the_page() {
     let capped = queries::find_sessions_touching_file_indexed(
         &conn,
         Some(&idx),
-        "/home/dev/alpha/main.py",
+        &fixture_path("alpha/main.py"),
         1_i64,
     )
     .expect("query");
@@ -554,7 +583,7 @@ fn the_content_half_is_skipped_once_the_exact_half_fills_the_page() {
     let unbounded = queries::find_sessions_touching_file_indexed(
         &conn,
         Some(&idx),
-        "/home/dev/alpha/main.py",
+        &fixture_path("alpha/main.py"),
         0_i64,
     )
     .expect("query");
@@ -570,7 +599,7 @@ fn touching_file_budgeted_packs_the_merged_set() {
     let packed = queries::find_sessions_touching_file_budgeted_indexed(
         &conn,
         Some(&idx),
-        "/home/dev/alpha/main.py",
+        &fixture_path("alpha/main.py"),
         20_i64,
         &budget(),
     )
@@ -583,7 +612,7 @@ fn touching_file_budgeted_packs_the_merged_set() {
     let squeezed = queries::find_sessions_touching_file_budgeted_indexed(
         &conn,
         Some(&idx),
-        "/home/dev/alpha/main.py",
+        &fixture_path("alpha/main.py"),
         20_i64,
         &tiny,
     )
@@ -668,27 +697,23 @@ fn the_risk_summary_still_counts_with_like_while_the_list_comes_from_bm25() {
     // finding 3) and it is what an agent reading the report sees today.
     let scratch = Scratch::new("contradiction");
     let conn = store(&scratch);
-    let path = "/home/dev/alpha/ghost.py";
+    let path = fixture_path("alpha/ghost.py");
+    let mention = format!("poked at {path} by hand");
     let idx = index(
         &scratch,
         &[
             // Indexed prose mentioning a path the store's own text never does.
-            (
-                SID_B,
-                "-home-dev-alpha",
-                "poked at /home/dev/alpha/ghost.py by hand",
-                "2026-01-02T09:10:00",
-            ),
+            (SID_B, "-home-dev-alpha", &mention, "2026-01-02T09:10:00"),
         ],
     );
 
-    let risk = queries::file_risk_summary(&conn, path, None, 5).expect("risk");
+    let risk = queries::file_risk_summary(&conn, &path, None, 5).expect("risk");
     assert_eq!(
         risk.total_sessions, 0,
         "the store's own text never names it"
     );
 
-    let listed = queries::find_sessions_touching_file_indexed(&conn, Some(&idx), path, 20_i64)
+    let listed = queries::find_sessions_touching_file_indexed(&conn, Some(&idx), &path, 20_i64)
         .expect("query");
     assert_eq!(
         ids(&listed),

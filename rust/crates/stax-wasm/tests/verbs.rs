@@ -87,27 +87,60 @@ CREATE TABLE session_mart (
 fn fixture() -> (Scratch, PathBuf) {
     let scratch = Scratch::new();
     let path = scratch.join("store.db");
+    let project = scratch.join("project");
+    std::fs::create_dir_all(&project).expect("project fixture");
+    let project = std::fs::canonicalize(project).expect("canonical project fixture");
+    let project_text = project.to_string_lossy().into_owned();
+    let app_text = project.join("app.py").to_string_lossy().into_owned();
     let conn = rusqlite::Connection::open(&path).expect("create fixture");
     conn.execute_batch(SCHEMA).expect("schema");
     conn.pragma_update(None, "user_version", 30)
         .expect("user_version");
+    conn.execute(
+        "INSERT INTO projects VALUES (1,'claude','-tmp-demo',?1,'demo',0.0,0.0,NULL)",
+        [&project_text],
+    )
+    .expect("project row");
     conn.execute_batch(
         "
-INSERT INTO projects VALUES (1,'claude','-tmp-demo','/tmp/demo','demo',0.0,0.0,NULL);
 INSERT INTO sessions VALUES (1,1,'sess-one','2026-07-01T00:00:00Z','2026-07-02T00:00:00Z',3,NULL,NULL,NULL,NULL);
 INSERT INTO sessions VALUES (2,1,'sess-two','2026-07-03T00:00:00Z','2026-07-04T00:00:00Z',1,NULL,NULL,NULL,NULL);
 INSERT INTO messages_202607 (id,session_fk,seq,timestamp,role,content_text,tools_json,raw_json)
   VALUES (1,1,0,'2026-07-01T00:00:00Z','user','we decided to add a cache layer','[]','{}');
 INSERT INTO messages_202607 (id,session_fk,seq,timestamp,role,content_text,tools_json,raw_json)
-  VALUES (2,1,1,'2026-07-01T00:01:00Z','assistant','the cache worked, tests pass','[{\"name\":\"Edit\",\"input\":{\"file_path\":\"/tmp/demo/app.py\"}}]','{}');
-INSERT INTO messages_202607 (id,session_fk,seq,timestamp,role,content_text,tools_json,raw_json)
-  VALUES (3,1,2,'2026-07-02T00:00:00Z','assistant','reverted the cache change, it failed','[{\"name\":\"Edit\",\"input\":{\"file_path\":\"/tmp/demo/app.py\"}}]','{}');
-INSERT INTO messages_202607 (id,session_fk,seq,timestamp,role,content_text,tools_json,raw_json)
   VALUES (4,2,0,'2026-07-03T00:00:00Z','user','unrelated chatter','[]','{}');
-INSERT INTO session_mart VALUES ('sess-one',1,'claude',NULL,'2026-07-01T00:00:00Z','2026-07-02T00:00:00Z',3,1,2,0,0,0,0,1.25,0,'/tmp/demo');
 ",
     )
     .expect("rows");
+    let tools = serde_json::to_string(&serde_json::json!([{
+        "name": "Edit",
+        "input": {"file_path": app_text}
+    }]))
+    .expect("tools JSON");
+    for (id, seq, timestamp, content) in [
+        (2, 1, "2026-07-01T00:01:00Z", "the cache worked, tests pass"),
+        (
+            3,
+            2,
+            "2026-07-02T00:00:00Z",
+            "reverted the cache change, it failed",
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO messages_202607
+               (id,session_fk,seq,timestamp,role,content_text,tools_json,raw_json)
+             VALUES (?1,1,?2,?3,'assistant',?4,?5,'{}')",
+            rusqlite::params![id, seq, timestamp, content, tools],
+        )
+        .expect("tool row");
+    }
+    conn.execute(
+        "INSERT INTO session_mart VALUES
+         ('sess-one',1,'claude',NULL,'2026-07-01T00:00:00Z','2026-07-02T00:00:00Z',
+          3,1,2,0,0,0,0,1.25,0,?1)",
+        [&project_text],
+    )
+    .expect("mart row");
     drop(conn);
     (scratch, path)
 }
@@ -116,10 +149,29 @@ INSERT INTO session_mart VALUES ('sess-one',1,'claude',NULL,'2026-07-01T00:00:00
 /// this file can pass or fail because of when it ran.
 const NOW: f64 = 1_785_888_000.0;
 
-fn options() -> Options {
+fn project_path(store: &Path) -> PathBuf {
+    let path = store
+        .parent()
+        .expect("fixture store parent")
+        .join("project");
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+fn project_text(store: &Path) -> String {
+    project_path(store).to_string_lossy().into_owned()
+}
+
+fn app_text(store: &Path) -> String {
+    project_path(store)
+        .join("app.py")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn options(store: &Path) -> Options {
     Options {
         now_epoch: NOW,
-        cwd: "/tmp/demo".to_string(),
+        cwd: project_text(store),
         ..Options::default()
     }
 }
@@ -142,7 +194,7 @@ fn decisions_finds_the_seeded_session_and_keeps_the_envelope_shape() {
         &path,
         &Request::Decisions {
             query: "cache".into(),
-            options: options(),
+            options: options(&path),
         },
     );
     assert_eq!(outcome.code, 0);
@@ -167,7 +219,7 @@ fn the_envelope_key_order_is_the_contract() {
         &path,
         &Request::Decisions {
             query: "cache".into(),
-            options: options(),
+            options: options(&path),
         },
     );
     let keys: Vec<&str> = outcome
@@ -193,7 +245,7 @@ fn an_empty_project_scope_means_every_project_not_the_cwd() {
             options: Options {
                 project: Some(String::new()),
                 cwd: "/somewhere/else".into(),
-                ..options()
+                ..options(&path)
             },
         },
     );
@@ -212,7 +264,7 @@ fn a_query_with_no_word_characters_is_the_error_envelope_and_exit_1() {
         &path,
         &Request::Decisions {
             query: "***".into(),
-            options: options(),
+            options: options(&path),
         },
     );
     assert_eq!(outcome.code, 1);
@@ -236,7 +288,7 @@ fn a_malformed_since_is_a_value_error_envelope_not_a_panic() {
             query: "cache".into(),
             options: Options {
                 since: Some("not-a-date".into()),
-                ..options()
+                ..options(&path)
             },
         },
     );
@@ -247,18 +299,19 @@ fn a_malformed_since_is_a_value_error_envelope_not_a_panic() {
 #[test]
 fn file_reports_risk_and_tags_each_row_with_its_kind() {
     let (_scratch, path) = fixture();
+    let app = app_text(&path);
     let outcome = run(
         &path,
         &Request::File {
-            path: "/tmp/demo/app.py".into(),
-            options: options(),
+            path: app.clone(),
+            options: options(&path),
         },
     );
     let value = envelope(&outcome);
     assert_eq!(value["command"], "file");
-    assert_eq!(value["query"]["path"], "/tmp/demo/app.py");
+    assert_eq!(value["query"]["path"], app);
     let risk = &value["risk"];
-    assert_eq!(risk["path"], "/tmp/demo/app.py");
+    assert_eq!(risk["path"], app);
     assert_eq!(risk["total_sessions"], 1);
     // The keys and their order are the contract (`RiskSummary::to_dict`); the
     // classifier's own counts are stax-core's business, and this fixture's
@@ -305,10 +358,10 @@ fn a_relative_file_path_resolves_against_the_declared_cwd() {
         &path,
         &Request::File {
             path: "app.py".into(),
-            options: options(),
+            options: options(&path),
         },
     );
-    assert_eq!(envelope(&outcome)["risk"]["path"], "/tmp/demo/app.py");
+    assert_eq!(envelope(&outcome)["risk"]["path"], app_text(&path));
 }
 
 #[test]
@@ -318,7 +371,7 @@ fn worked_finds_the_positive_outcome_only() {
         &path,
         &Request::Worked {
             action: "cache".into(),
-            options: options(),
+            options: options(&path),
         },
     );
     let value = envelope(&outcome);
@@ -334,8 +387,8 @@ fn sessions_scopes_to_a_path_and_labels_the_scope() {
     let outcome = run(
         &path,
         &Request::Sessions {
-            path: Some("/tmp/demo".into()),
-            options: options(),
+            path: Some(project_text(&path)),
+            options: options(&path),
         },
     );
     let value = envelope(&outcome);
@@ -352,10 +405,10 @@ fn sessions_takes_the_callers_word_on_whether_the_target_is_a_file() {
     let outcome = run(
         &path,
         &Request::Sessions {
-            path: Some("/tmp/demo/app.py".into()),
+            path: Some(app_text(&path)),
             options: Options {
                 is_file: true,
-                ..options()
+                ..options(&path)
             },
         },
     );
@@ -370,10 +423,10 @@ fn a_tiny_budget_truncates_and_says_so() {
     let outcome = run(
         &path,
         &Request::Sessions {
-            path: Some("/tmp/demo".into()),
+            path: Some(project_text(&path)),
             options: Options {
                 context_budget: Some(1),
-                ..options()
+                ..options(&path)
             },
         },
     );
@@ -391,7 +444,7 @@ fn store_renders_the_bytes_the_cli_prints() {
         &Request::Store {
             options: Options {
                 store_label: "/data/su/store.db".into(),
-                ..options()
+                ..options(&path)
             },
         },
     );
@@ -440,7 +493,9 @@ fn opening_something_that_is_not_a_store_is_an_error() {
     let path = scratch.join("not-a-db");
     std::fs::write(&path, b"this is not a database").expect("write");
     let conn = db::open_path(&path).expect("sqlite opens lazily");
-    let request = Request::Store { options: options() };
+    let request = Request::Store {
+        options: options(&path),
+    };
     assert!(
         verbs::run(&conn, &request).is_err(),
         "the first real read must fail rather than answer"

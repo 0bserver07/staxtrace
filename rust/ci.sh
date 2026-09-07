@@ -81,17 +81,20 @@
 #                               assignment. `rust/PROJECT-SET-DIFFER.md` is
 #                               the argument in full.
 #
-# Usage:  rust/ci.sh                (runs all seven)
-#         rust/ci.sh --skip-parity  (gates 0-3 only; boxes without the venv)
+# Usage:  rust/ci.sh                       (runs all seven)
+#         rust/ci.sh --skip-parity         (gates 0-3 only; boxes without the venv)
+#         rust/ci.sh --clean-checkout-only (gate 0 only)
 # Exit:   first failing gate's status.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
 SKIP_PARITY=0
+CLEAN_CHECKOUT_ONLY=0
 for arg in "$@"; do
     case "$arg" in
         --skip-parity) SKIP_PARITY=1 ;;
+        --clean-checkout-only) CLEAN_CHECKOUT_ONLY=1 ;;
         *) echo "ci.sh: unknown argument '$arg'" >&2; exit 2 ;;
     esac
 done
@@ -116,26 +119,18 @@ gate() {
 # to compile from a clean checkout while every in-tree run stayed green. The
 # working tree's opinion of itself is not evidence.
 #
-# The extraction set is `rust/` plus everything the crates read AT BUILD TIME.
-# `stackunderflow/data/` is in it because `stax-etl`'s stats layer embeds the
-# rate card with `include_str!("../../../../../stackunderflow/data/models.toml")`
-# — reading the same file the reference reads rather than transcribing it (spec
-# §2.4), which is right, and which puts a compile-time dependency outside
-# `rust/`. Reproduced 2026-07-31 by extracting without it:
-#   error: couldn't read …/stackunderflow/data/models.toml (os error 2)
-# If another crate ever `include_str!`s outside `rust/`, its path goes here too.
+# The extraction set is the Rust workspace plus the contracts exercised by its
+# tests. All compile-time data, migrations, skills and UI files live under
+# `rust/assets/`, so archiving the entire workspace is both complete and hard to
+# make stale when a new embedded asset class is added. `git archive` takes only
+# tracked files: a build that accidentally depends on an untracked source or
+# asset therefore fails here even when an in-tree build succeeds.
 #
-# WAVE 10 ITEM 2c added three more, and they are the reason the binaries can now
-# run with `stackunderflow/` deleted (`docs/specs/decommission-report.md` §4.3):
-#   stackunderflow/adapters/capabilities.json  stax-adapters::capabilities
-#   stackunderflow/infra/                      stax-reports::prescribe
-#   stackunderflow/static/                     stax-server's build.rs
-# The last is a DIRECTORY, not a file: `build.rs` walks it and emits one
-# `include_bytes!` per file, so a checkout missing it fails the build loudly
-# rather than shipping a dashboard that 404s itself. `git archive` takes TRACKED
-# files only — which is also what a release ships, so a stray untracked asset in
-# a working tree is embedded by an in-tree build and not by this gate, and the
-# binary-size difference is the tell.
+# The archive path is unique on every run, so Cargo sees new path-package IDs
+# and re-evaluates build-script dependencies while still reusing third-party
+# artifacts from the caller's target directory. Incremental compilation is
+# disabled for this gate so an old workspace object cannot stand in for the
+# extracted tracked source.
 # STANDALONE, NOT A GATE (same ruling as `hooks-parity.sh`): `sync-parity.sh`
 # copies four SQLite fixtures per case per implementation across 173 corpus rows
 # and spawns two processes for each, plus nine `age` round trips and ten CLI
@@ -147,15 +142,87 @@ gate() {
 #   rust/sync-parity.sh                # 192 identical / 0 divergent
 #   rust/sync-parity.sh --build-state  # rebuild the synthetic multi-device stores
 
-echo "=== gate 0/7  clean-checkout build (git archive HEAD) ==="
-_cc_tmp="$(mktemp -d)"
-( cd "$(git rev-parse --show-toplevel)" \
-    && git archive HEAD rust/ contracts/ stackunderflow/data/ stackunderflow/store/migrations/ \
-         stackunderflow/adapters/capabilities.json stackunderflow/infra/ stackunderflow/static/ ) | tar -x -C "$_cc_tmp"
-( cd "$_cc_tmp/rust" && cargo check --workspace --quiet ) \
-    || { echo "GATE 0 FAILED: HEAD does not build from a clean checkout"; rm -rf "$_cc_tmp"; exit 1; }
-rm -rf "$_cc_tmp"
-echo "    clean checkout builds"
+_cc_tmp=""
+
+cleanup_clean_checkout() {
+    if [[ -n "$_cc_tmp" && "$_cc_tmp" != "/" && -d "$_cc_tmp" ]]; then
+        rm -rf -- "$_cc_tmp"
+    fi
+    _cc_tmp=""
+}
+
+trap cleanup_clean_checkout EXIT
+trap 'exit 130' HUP INT TERM
+
+require_clean_checkout_file() {
+    local archive_root="$1"
+    local relative_path="$2"
+    local asset_class="$3"
+    if [[ ! -f "$archive_root/$relative_path" ]]; then
+        echo "GATE 0 FAILED: missing required embedded asset class: $asset_class ($relative_path)" >&2
+        return 1
+    fi
+}
+
+run_clean_checkout_gate() {
+    local repo_root tmp_parent
+    repo_root="$(git rev-parse --show-toplevel)"
+    tmp_parent="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+    _cc_tmp="$(mktemp -d "$tmp_parent/stax-clean-checkout.XXXXXXXX")"
+    if [[ ! -d "$_cc_tmp" || "$_cc_tmp" == "/" ]]; then
+        echo "GATE 0 FAILED: could not create a bounded temporary archive" >&2
+        return 1
+    fi
+
+    if ! (cd "$repo_root" && git archive --format=tar HEAD -- rust contracts) \
+        | tar -x -C "$_cc_tmp"; then
+        echo "GATE 0 FAILED: could not extract tracked Rust build inputs" >&2
+        return 1
+    fi
+
+    # A strict symbolic test hook exercises the missing-asset path without
+    # accepting a filesystem path or allowing deletion outside the archive.
+    case "${STAX_CLEAN_CHECKOUT_TEST_MISSING_ASSET:-}" in
+        "") ;;
+        ui-bundle-receipt)
+            rm -f -- "$_cc_tmp/rust/assets/static/ui-bundle-provenance.json"
+            ;;
+        *)
+            echo "GATE 0 FAILED: unknown missing-asset test selector" >&2
+            return 2
+            ;;
+    esac
+
+    require_clean_checkout_file "$_cc_tmp" \
+        rust/assets/data/models.toml "pricing manifest"
+    require_clean_checkout_file "$_cc_tmp" \
+        rust/assets/adapters/capabilities.json "adapter capability table"
+    require_clean_checkout_file "$_cc_tmp" \
+        rust/assets/infra/model_candidates.json "model candidate table"
+    require_clean_checkout_file "$_cc_tmp" \
+        rust/assets/static/react/index.html "UI entry point"
+    require_clean_checkout_file "$_cc_tmp" \
+        rust/assets/static/ui-bundle-provenance.json "UI bundle provenance receipt"
+
+    if ! (cd "$_cc_tmp/rust" \
+        && CARGO_INCREMENTAL=0 \
+            CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo_root/rust/target}" \
+            cargo check --workspace --all-targets --locked --quiet); then
+        echo "GATE 0 FAILED: HEAD does not build and compile its tests from a clean checkout" >&2
+        return 1
+    fi
+
+    cleanup_clean_checkout
+    echo "    clean checkout builds and its tests compile"
+}
+
+echo "=== gate 0/7  clean-checkout build/test compilation (git archive HEAD) ==="
+run_clean_checkout_gate
+
+if [[ "$CLEAN_CHECKOUT_ONLY" = 1 ]]; then
+    echo "clean-checkout gate green"
+    exit 0
+fi
 
 gate "gate 1/7  cargo fmt --check" cargo fmt --check
 gate "gate 2/7  cargo clippy --workspace --all-targets -- -D warnings" \

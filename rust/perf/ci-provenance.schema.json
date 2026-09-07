@@ -1,0 +1,64 @@
+{
+  "title": "StaxTrace hosted performance baseline provenance",
+  "type": "object",
+  "required": [
+    "schema", "creation_source", "workflow_path", "workflow_run_id", "workflow_run_attempt",
+    "source_commit", "policy_digest", "scenario_identity_digest",
+    "evidence_schema_digest", "runner_label", "runner_key", "baseline_digest",
+    "creation_manifest_digest", "creation_resolution_proof_digest",
+    "aggregate_digest", "source_suite_digests",
+    "source_harness_run_ids", "source_workflow_run_ids",
+    "source_workflow_run_attempts"
+  ],
+  "properties": {
+    "schema": {"const": "staxtrace.performance-ci-baseline-provenance"},
+    "creation_source": {"const": "protected_manifest"},
+    "workflow_path": {"const": ".github/workflows/perf.yml"},
+    "workflow_run_id": {
+      "type": "integer", "minimum": 1, "maximum": 9223372036854775807
+    },
+    "workflow_run_attempt": {
+      "type": "integer", "minimum": 1, "maximum": 2147483647
+    },
+    "source_commit": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+    "policy_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "scenario_identity_digest": {
+      "type": "string", "pattern": "^[a-f0-9]{64}$"
+    },
+    "evidence_schema_digest": {
+      "type": "string", "pattern": "^[a-f0-9]{64}$"
+    },
+    "runner_label": {
+      "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "runner_key": {"type": "string", "minLength": 1, "maxLength": 255},
+    "baseline_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "creation_manifest_digest": {
+      "type": "string", "pattern": "^[a-f0-9]{64}$"
+    },
+    "creation_resolution_proof_digest": {
+      "type": "string", "pattern": "^[a-f0-9]{64}$"
+    },
+    "aggregate_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "source_suite_digests": {
+      "type": "array", "minItems": 3, "maxItems": 3,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+    },
+    "source_harness_run_ids": {
+      "type": "array", "minItems": 3, "maxItems": 3,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-f0-9]{32}$"}
+    },
+    "source_workflow_run_ids": {
+      "type": "array", "minItems": 3, "maxItems": 3,
+      "uniqueItems": true,
+      "items": {"type": "integer", "minimum": 1, "maximum": 9223372036854775807}
+    },
+    "source_workflow_run_attempts": {
+      "type": "array", "minItems": 3, "maxItems": 3,
+      "items": {"type": "integer", "minimum": 1, "maximum": 2147483647}
+    }
+  },
+  "additionalProperties": false
+}
