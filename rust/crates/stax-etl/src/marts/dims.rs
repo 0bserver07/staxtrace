@@ -34,9 +34,13 @@ use anyhow::Result;
 use rusqlite::Connection;
 use serde_json::Value;
 
-use crate::stats::classifier::{INTERRUPT_API, INTERRUPT_PREFIX, RawEntry, determine_kind, tag};
+use crate::stats::classifier::{
+    INTERRUPT_API, INTERRUPT_PREFIX, RawEntry, determine_kind, tag_one,
+};
 use crate::stats::command_analysis::command_analysis;
-use crate::stats::enricher::{build, has_result_block_of, text_from, tools_from_raw};
+use crate::stats::enricher::{
+    EnrichedDataset, build, has_result_block_of, text_from, tools_from_raw,
+};
 use crate::stats::pytext::py_json_dumps_counter;
 
 /// The v022 message-type + command dims.
@@ -75,6 +79,7 @@ pub struct InteractionDims {
 }
 
 /// One `messages` row as the dims pass sees it.
+#[derive(Debug, Clone)]
 pub struct DimRow {
     /// `m.raw_json`.
     pub raw_json: Option<String>,
@@ -91,6 +96,17 @@ pub struct DimRow {
 /// Callers pass only ids they just wrote a row for (the events pass or the
 /// coverage seed), so the UPDATE always matches; an id that somehow has no row
 /// is a silent no-op rather than an error.
+///
+/// # Memory
+///
+/// The project's rows are folded as they stream out of SQLite: each payload is
+/// parsed, tallied, classified into a lean [`crate::stats::enricher::Record`]
+/// and dropped before the next row is read. The first port collected every
+/// row, raw JSON included, and then every parsed payload, before counting
+/// anything — a 1.9 GB peak on an 83,000-message project, once per watcher
+/// tick that touched it, which is what the resident's "2–3 GB" was. Nothing
+/// but the lean records accumulates now, and the numbers are the same row for
+/// row: the ignored `bench_…` harness run with `ALL` is the oracle.
 pub fn refresh_message_dims(conn: &Connection, project_ids: &[i64]) -> Result<()> {
     // The query shape is §6b territory and is ported literally, `ORDER BY
     // m.timestamp` included — the interaction grouping downstream is a stable
@@ -122,18 +138,15 @@ pub fn refresh_message_dims(conn: &Connection, project_ids: &[i64]) -> Result<()
     )?;
 
     for pid in project_ids {
-        let rows: Vec<DimRow> = scan
-            .query_map([pid], |r| {
-                Ok(DimRow {
-                    raw_json: r.get::<_, Option<String>>("raw_json")?,
-                    session_id: r.get::<_, Option<String>>("session_id")?,
-                    timestamp: r.get::<_, Option<String>>("timestamp")?,
-                    provider: r.get::<_, Option<String>>("provider")?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let (dims, rate) = count_dims(&rows);
+        let rows = scan.query_map([pid], |r| {
+            Ok(DimRow {
+                raw_json: r.get::<_, Option<String>>("raw_json")?,
+                session_id: r.get::<_, Option<String>>("session_id")?,
+                timestamp: r.get::<_, Option<String>>("timestamp")?,
+                provider: r.get::<_, Option<String>>("provider")?,
+            })
+        })?;
+        let (dims, rate) = fold_dims(rows)?;
         update.execute(rusqlite::params![
             dims.user,
             dims.assistant,
@@ -153,41 +166,96 @@ pub fn refresh_message_dims(conn: &Connection, project_ids: &[i64]) -> Result<()
     Ok(())
 }
 
-/// Both counters over one shared parse of the project's rows.
+/// Both counters over one shared parse of the project's rows, from a slice —
+/// the shape the tests use. [`refresh_message_dims`] runs the same fold over
+/// the store's cursor.
 ///
 /// See the module docs for why sharing the parse is safe.
 #[must_use]
 pub fn count_dims(rows: &[DimRow]) -> (MessageDims, InteractionDims) {
-    // Parse once. Both Python counters open with the identical guard, so one
-    // filter serves both:
-    //
-    //     try:
-    //         payload = json.loads(rj) if rj else {}
-    //     except (json.JSONDecodeError, TypeError, ValueError):
-    //         continue
-    //     if not isinstance(payload, dict):
-    //         continue
-    //
-    // The `if rj else {}` is not a convenience — a NULL or empty `raw_json` is
-    // **processed as an empty dict**, not skipped, and an empty dict has no
-    // `type` and no `message.role`, so DIV-002's fall-through files it as an
-    // *assistant message*. It then also counts as an assistant step of whatever
-    // command precedes it. A port that treats "nothing to parse" as "nothing to
-    // count" reads the same and moves four columns.
-    let parsed: Vec<(&DimRow, Value)> = rows
-        .iter()
-        .filter_map(|r| {
-            let v = match r.raw_json.as_deref() {
-                None | Some("") => Value::Object(serde_json::Map::new()),
-                Some(text) => super::json::loads(Some(text))?,
-            };
-            v.is_object().then_some((r, v))
-        })
-        .collect();
+    fold_dims(rows.iter().cloned().map(Ok)).expect("a slice yields no row errors")
+}
 
-    let dims = count_message_dims(parsed.iter().map(|(_, v)| v));
-    let rate = count_interaction_dims(parsed);
-    (dims, rate)
+/// The fold: rows in, the twelve numerators out, one payload alive at a time.
+///
+/// A row error stops the stream and is returned after the enricher drains
+/// what came before it, so a bad row means no UPDATE — the same outcome as
+/// the collect-then-count shape, without the collect.
+fn fold_dims<I: Iterator<Item = rusqlite::Result<DimRow>>>(
+    rows: I,
+) -> rusqlite::Result<(MessageDims, InteractionDims)> {
+    let mut dims = MessageDims::default();
+    let mut failure: Option<rusqlite::Error> = None;
+    let tagged = rows
+        .map_while(|row| match row {
+            Ok(row) => Some(row),
+            Err(err) => {
+                failure = Some(err);
+                None
+            }
+        })
+        .filter_map(parse_row)
+        .map(|(row, payload)| {
+            tally_message(&mut dims, &payload);
+            tag_one(raw_entry(row, payload))
+        });
+    let dataset = build(tagged);
+    if let Some(err) = failure {
+        return Err(err);
+    }
+    let rate = interaction_numerators(&dataset);
+    Ok((dims, rate))
+}
+
+/// Parse one row's payload and drop its text. `None` skips the row.
+///
+/// Both Python counters open with the identical guard, so one filter serves
+/// both:
+///
+/// ```text
+/// try:
+///     payload = json.loads(rj) if rj else {}
+/// except (json.JSONDecodeError, TypeError, ValueError):
+///     continue
+/// if not isinstance(payload, dict):
+///     continue
+/// ```
+///
+/// The `if rj else {}` is not a convenience — a NULL or empty `raw_json` is
+/// **processed as an empty dict**, not skipped, and an empty dict has no
+/// `type` and no `message.role`, so DIV-002's fall-through files it as an
+/// *assistant message*. It then also counts as an assistant step of whatever
+/// command precedes it. A port that treats "nothing to parse" as "nothing to
+/// count" reads the same and moves four columns.
+fn parse_row(mut row: DimRow) -> Option<(DimRow, Value)> {
+    let raw = row.raw_json.take();
+    let payload = match raw.as_deref() {
+        None | Some("") => Value::Object(serde_json::Map::new()),
+        Some(text) => super::json::loads(Some(text))?,
+    };
+    payload.is_object().then_some((row, payload))
+}
+
+/// The second counter's entry shape: the clean column timestamp wins over any
+/// timestamp in the raw payload, exactly as `queries.build_enriched_dataset`
+/// does it.
+fn raw_entry(row: DimRow, mut payload: Value) -> RawEntry {
+    // `if r["timestamp"]: payload["timestamp"] = r["timestamp"]` — a truthy
+    // column value overwrites; NULL and '' leave the payload's own.
+    if let Some(ts) = row.timestamp.as_deref().filter(|t| !t.is_empty())
+        && let Some(obj) = payload.as_object_mut()
+    {
+        obj.insert("timestamp".to_string(), Value::String(ts.to_string()));
+    }
+    RawEntry {
+        payload,
+        session_id: row.session_id.unwrap_or_default(),
+        // `provider=r["provider"] or "anthropic"`
+        provider: match row.provider.as_deref() {
+            Some(p) if !p.is_empty() => p.to_string(),
+            _ => "anthropic".to_string(),
+        },
+    }
 }
 
 /// `project._count_message_dims`.
@@ -203,59 +271,38 @@ pub fn count_dims(rows: &[DimRow]) -> (MessageDims, InteractionDims) {
 pub fn count_message_dims<'a>(payloads: impl Iterator<Item = &'a Value>) -> MessageDims {
     let mut d = MessageDims::default();
     for payload in payloads {
-        let kind = determine_kind(payload);
-        let has_tool_result = has_result_block_of(payload);
-        if has_tool_result {
-            d.tool_result += 1;
-        }
-        if kind == "user" {
-            d.user += 1;
-            if !has_tool_result {
-                let text = text_from(payload);
-                if !(text.starts_with(INTERRUPT_PREFIX) || text.starts_with(INTERRUPT_API)) {
-                    d.commands += 1;
-                }
-            }
-        } else if kind == "assistant" {
-            d.assistant += 1;
-            if !tools_from_raw(payload).is_empty() {
-                d.tool_use += 1;
-            }
-        }
+        tally_message(&mut d, payload);
     }
     d
 }
 
-/// `project._count_interaction_dims`.
-///
-/// Rebuilds the project's `EnrichedDataset` the same way
-/// `queries.build_enriched_dataset` does — the clean column timestamp wins over
-/// any timestamp in the raw payload — then reads the numerators straight off
-/// the records and `aggregator._command_analysis`.
-#[must_use]
-pub fn count_interaction_dims(parsed: Vec<(&DimRow, Value)>) -> InteractionDims {
-    let mut raw_entries: Vec<RawEntry> = Vec::with_capacity(parsed.len());
-    for (r, mut payload) in parsed {
-        // `if r["timestamp"]: payload["timestamp"] = r["timestamp"]` — a truthy
-        // column value overwrites; NULL and '' leave the payload's own.
-        if let Some(ts) = r.timestamp.as_deref().filter(|t| !t.is_empty())
-            && let Some(obj) = payload.as_object_mut()
-        {
-            obj.insert("timestamp".to_string(), Value::String(ts.to_string()));
-        }
-        let session_id = r.session_id.clone().unwrap_or_default();
-        raw_entries.push(RawEntry {
-            payload,
-            session_id,
-            // `provider=r["provider"] or "anthropic"`
-            provider: match r.provider.as_deref() {
-                Some(p) if !p.is_empty() => p.to_string(),
-                _ => "anthropic".to_string(),
-            },
-        });
+/// One payload's contribution to [`MessageDims`].
+fn tally_message(d: &mut MessageDims, payload: &Value) {
+    let kind = determine_kind(payload);
+    let has_tool_result = has_result_block_of(payload);
+    if has_tool_result {
+        d.tool_result += 1;
     }
+    if kind == "user" {
+        d.user += 1;
+        if !has_tool_result {
+            let text = text_from(payload);
+            if !(text.starts_with(INTERRUPT_PREFIX) || text.starts_with(INTERRUPT_API)) {
+                d.commands += 1;
+            }
+        }
+    } else if kind == "assistant" {
+        d.assistant += 1;
+        if !tools_from_raw(payload).is_empty() {
+            d.tool_use += 1;
+        }
+    }
+}
 
-    let dataset = build(tag(raw_entries));
+/// `project._count_interaction_dims`, read off the enriched dataset the fold
+/// built: the numerators straight off the records and
+/// `aggregator._command_analysis`.
+fn interaction_numerators(dataset: &EnrichedDataset) -> InteractionDims {
     let records = &dataset.records;
 
     let cache_read_messages = records
@@ -292,7 +339,7 @@ pub fn count_interaction_dims(parsed: Vec<(&DimRow, Value)>) -> InteractionDims 
         })
         .collect();
 
-    let ca = command_analysis(&dataset);
+    let ca = command_analysis(dataset);
 
     #[allow(clippy::cast_possible_wrap)]
     InteractionDims {
@@ -332,14 +379,23 @@ mod tests {
                 .unwrap()
         } else {
             vec![
-                conn.query_row("SELECT id FROM projects WHERE slug = ?", [&slug], |r| r.get(0))
-                    .expect("project slug exists"),
+                conn.query_row("SELECT id FROM projects WHERE slug = ?", [&slug], |r| {
+                    r.get(0)
+                })
+                .expect("project slug exists"),
             ]
         };
+        let id_list = ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         let messages: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM messages m JOIN sessions s ON s.id = m.session_fk WHERE s.project_id IN (SELECT id FROM projects WHERE ? = 'ALL' OR slug = ?)",
-                [&slug, &slug],
+                &format!(
+                    "SELECT COUNT(*) FROM messages m JOIN sessions s ON s.id = m.session_fk WHERE s.project_id IN ({id_list})"
+                ),
+                [],
                 |r| r.get(0),
             )
             .unwrap();
