@@ -1,0 +1,120 @@
+{
+  "title": "StaxTrace hosted performance baseline resolution",
+  "type": "object",
+  "required": [
+    "schema", "state", "source_kind", "selector", "workflow_path",
+    "runner_label", "workflow_id", "workflow_run_id",
+    "workflow_run_attempt", "source_commit", "artifact_id", "artifact_name",
+    "artifact_size", "artifact_digest", "protected_manifest_digest",
+    "artifact_tree_digest",
+    "resolution_proof_digest",
+    "protected_sources"
+  ],
+  "properties": {
+    "schema": {"const": "staxtrace.performance-ci-resolution"},
+    "workflow_path": {"const": ".github/workflows/perf.yml"},
+    "runner_label": {
+      "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "state": {
+      "enum": [
+        "no_selector", "artifact_unavailable", "artifact_expired", "selected",
+        "protected_candidates"
+      ]
+    },
+    "source_kind": {"enum": ["none", "prior_run", "protected_manifest"]},
+    "selector": {
+      "type": ["string", "null"], "pattern": "^[1-9][0-9]{0,19}:[1-9][0-9]{0,9}$"
+    },
+    "workflow_id": {
+      "type": ["integer", "null"], "minimum": 1,
+      "maximum": 9223372036854775807
+    },
+    "workflow_run_id": {
+      "type": ["integer", "null"], "minimum": 1,
+      "maximum": 9223372036854775807
+    },
+    "workflow_run_attempt": {
+      "type": ["integer", "null"], "minimum": 1,
+      "maximum": 2147483647
+    },
+    "source_commit": {
+      "type": ["string", "null"], "pattern": "^[a-f0-9]{40}$"
+    },
+    "artifact_id": {
+      "type": ["integer", "null"], "minimum": 1,
+      "maximum": 9223372036854775807
+    },
+    "artifact_name": {
+      "type": ["string", "null"],
+      "pattern": "^staxtrace-performance-evidence-[1-9][0-9]*-[1-9][0-9]*$"
+    },
+    "artifact_size": {
+      "type": ["integer", "null"], "minimum": 1, "maximum": 2097152
+    },
+    "artifact_digest": {
+      "type": ["string", "null"], "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "artifact_tree_digest": {
+      "type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"
+    },
+    "protected_manifest_digest": {
+      "type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"
+    },
+    "resolution_proof_digest": {
+      "type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"
+    },
+    "protected_sources": {
+      "type": "array", "maxItems": 3, "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "required": [
+          "workflow_path", "runner_label", "workflow_id", "workflow_run_id",
+          "workflow_run_attempt", "source_commit", "step_proof_digest",
+          "artifact_id", "artifact_name", "artifact_size", "artifact_digest",
+          "artifact_tree_digest"
+        ],
+        "properties": {
+          "workflow_path": {"const": ".github/workflows/perf.yml"},
+          "runner_label": {
+            "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+          },
+          "workflow_id": {
+            "type": "integer", "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "workflow_run_id": {
+            "type": "integer", "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "workflow_run_attempt": {
+            "type": "integer", "minimum": 1, "maximum": 2147483647
+          },
+          "source_commit": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+          "step_proof_digest": {
+            "type": "string", "pattern": "^[a-f0-9]{64}$"
+          },
+          "artifact_id": {
+            "type": "integer", "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "artifact_name": {
+            "type": "string",
+            "pattern": "^staxtrace-performance-evidence-[1-9][0-9]*-[1-9][0-9]*$"
+          },
+          "artifact_size": {
+            "type": "integer", "minimum": 1, "maximum": 2097152
+          },
+          "artifact_digest": {
+            "type": "string", "pattern": "^sha256:[a-f0-9]{64}$"
+          },
+          "artifact_tree_digest": {
+            "type": "string", "pattern": "^[a-f0-9]{64}$"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

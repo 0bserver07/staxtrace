@@ -1,0 +1,39 @@
+{
+  "total_count": 2,
+  "jobs": [
+    {
+      "id": 7001,
+      "run_id": 11,
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "name": "performance qualification",
+      "status": "completed",
+      "conclusion": "failure",
+      "labels": ["hosted-performance"],
+      "steps": [
+        {"name": "Set up job", "status": "completed", "conclusion": "success"},
+        {"name": "Checkout", "status": "completed", "conclusion": "success"},
+        {"name": "Install pinned Rust toolchain", "status": "completed", "conclusion": "success"},
+        {"name": "Validate performance workflow contract", "status": "completed", "conclusion": "success"},
+        {"name": "Run deterministic performance contract tests", "status": "completed", "conclusion": "success"},
+        {"name": "Run absolute performance suite", "status": "completed", "conclusion": "success"},
+        {"name": "Snapshot validated absolute suite", "status": "completed", "conclusion": "success"},
+        {"name": "Resolve selected baseline", "status": "completed", "conclusion": "success"},
+        {"name": "Prepare validated upload", "status": "completed", "conclusion": "success"},
+        {"name": "Upload validated performance evidence", "status": "completed", "conclusion": "success"},
+        {"name": "Enforce comparative qualification", "status": "completed", "conclusion": "failure"},
+        {"name": "Post Checkout", "status": "completed", "conclusion": "success"},
+        {"name": "Complete job", "status": "completed", "conclusion": "success"}
+      ]
+    },
+    {
+      "id": 7002,
+      "run_id": 11,
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "name": "protected performance qualification",
+      "status": "completed",
+      "conclusion": "skipped",
+      "labels": ["hosted-performance"],
+      "steps": []
+    }
+  ]
+}
