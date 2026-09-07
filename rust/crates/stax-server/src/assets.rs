@@ -115,6 +115,12 @@ fn resolve_lexically(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    const UI_BUNDLE_RECEIPT: &str = "ui-bundle-provenance.json";
+
+    fn is_sha256(value: &str) -> bool {
+        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+
     #[test]
     fn the_bundle_is_compiled_in() {
         // If this fails the dashboard has no oracle and `stax-server` cannot
@@ -128,6 +134,36 @@ mod tests {
             "not the SPA entry"
         );
         assert!(get("favicon.ico").is_some(), "favicon.ico is embedded");
+    }
+
+    #[test]
+    fn the_ui_bundle_receipt_is_compiled_in_and_well_formed() {
+        let receipt = get(UI_BUNDLE_RECEIPT).expect("the UI provenance receipt is embedded");
+        let receipt: serde_json::Value =
+            serde_json::from_slice(receipt).expect("the UI provenance receipt is valid JSON");
+
+        assert_eq!(
+            receipt["schema"], "staxtrace.ui-bundle-provenance/1",
+            "unexpected UI provenance schema"
+        );
+        for field in [
+            "source_tree_sha256",
+            "lockfile_sha256",
+            "generated_output_tree_sha256",
+        ] {
+            let digest = receipt[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("{field} must be a string"));
+            assert!(is_sha256(digest), "{field} must be a SHA-256 digest");
+        }
+        assert!(
+            receipt["toolchain"]["node"].as_str().is_some(),
+            "the Node identity is required"
+        );
+        assert!(
+            receipt["toolchain"]["npm"].as_str().is_some(),
+            "the npm identity is required"
+        );
     }
 
     #[test]
