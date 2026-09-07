@@ -4129,6 +4129,22 @@ mod tests {
         }
     }
 
+    /// A platform-derived, canonical root for paths stored in the discovery
+    /// fixtures.  The root itself exists, so `resolve(strict=False)` resolves
+    /// any platform aliases before the synthetic suffix is appended.
+    fn fixture_path(relative: &str) -> String {
+        let root = fs::canonicalize(std::env::temp_dir()).expect("canonical temporary root");
+        paths::path_to_string(&root.join("stax-query-fixture").join(relative))
+    }
+
+    fn alpha_path(relative: &str) -> String {
+        fixture_path(&format!("alpha/{relative}"))
+    }
+
+    fn beta_path(relative: &str) -> String {
+        fixture_path(&format!("beta/{relative}"))
+    }
+
     /// The real schema, trimmed to the columns the discovery path reads.
     ///
     /// `messages` is a UNION-ALL view over monthly partitions because that is
@@ -4187,12 +4203,18 @@ mod tests {
     /// Two projects, three sessions, a handful of messages — enough to exercise
     /// every wave-1 read path including the empty-`content_text` blind spot.
     fn seed(conn: &Connection) {
+        let alpha = alpha_path("");
+        let beta = beta_path("");
+        conn.execute(
+            "INSERT INTO projects
+               (id, provider, slug, path, display_name, first_seen, last_modified)
+             VALUES (1, 'claude', '-home-dev-alpha', ?1, 'alpha', 0, 0),
+                    (2, 'codex',  '-home-dev-beta',  ?2, 'beta',  0, 0)",
+            rusqlite::params![alpha, beta],
+        )
+        .expect("seeding projects");
         conn.execute_batch(
             "
-            INSERT INTO projects (id, provider, slug, path, display_name, first_seen, last_modified)
-            VALUES (1, 'claude', '-home-dev-alpha', NULL, 'alpha', 0, 0),
-                   (2, 'codex',  '-home-dev-beta',  NULL, 'beta',  0, 0);
-
             INSERT INTO sessions (id, project_id, session_id, first_ts, last_ts, message_count)
             VALUES (1, 1, 'aaaaaaaa-1111-4111-8111-111111111111',
                     '2026-01-02T09:00:00+00:00', '2026-01-02T10:00:00+00:00', 6),
@@ -4212,6 +4234,16 @@ mod tests {
         .expect("seeding projects and sessions");
 
         // Session 1: an Edit of alpha/main.py the user then says broke.
+        let edit_tools = serde_json::to_string(&serde_json::json!([{
+            "name": "Edit",
+            "input": {"file_path": alpha_path("main.py")}
+        }]))
+        .expect("edit tools JSON");
+        let write_tools = serde_json::to_string(&serde_json::json!([{
+            "name": "Write",
+            "input": {"file_path": alpha_path("reader.py")}
+        }]))
+        .expect("write tools JSON");
         conn.execute_batch(
             r#"
             INSERT INTO messages_202601
@@ -4219,8 +4251,6 @@ mod tests {
             VALUES
               (1, 1, 1, '2026-01-02T09:10:00+00:00', 'user',
                'we should cache the watermark lookup', '[]'),
-              (2, 1, 2, '2026-01-02T09:20:00+00:00', 'assistant', '',
-               '[{"name": "Edit", "input": {"file_path": "/home/dev/alpha/main.py"}}]'),
               (3, 1, 3, '2026-01-02T09:30:00+00:00', 'user',
                'that broke the build', '[]'),
               (4, 1, 4, '2026-01-02T09:40:00+00:00', 'assistant', 'sorry, reverting', '[]');
@@ -4230,8 +4260,6 @@ mod tests {
             VALUES
               (5, 2, 1, '2026-01-03T09:10:00+00:00', 'user',
                'add the watermark cache to the reader', '[]'),
-              (6, 2, 2, '2026-01-03T09:20:00+00:00', 'assistant', '',
-               '[{"name": "Write", "input": {"file_path": "/home/dev/alpha/reader.py"}}]'),
               (7, 2, 3, '2026-01-03T09:30:00+00:00', 'user', 'that worked, thanks', '[]');
 
             INSERT INTO messages_202602
@@ -4243,6 +4271,20 @@ mod tests {
             "#,
         )
         .expect("seeding messages");
+        conn.execute(
+            "INSERT INTO messages_202601
+               (id, session_fk, seq, timestamp, role, content_text, tools_json)
+             VALUES (2, 1, 2, '2026-01-02T09:20:00+00:00', 'assistant', '', ?1)",
+            [edit_tools],
+        )
+        .expect("seeding edit message");
+        conn.execute(
+            "INSERT INTO messages_202601
+               (id, session_fk, seq, timestamp, role, content_text, tools_json)
+             VALUES (6, 2, 2, '2026-01-03T09:20:00+00:00', 'assistant', '', ?1)",
+            [write_tools],
+        )
+        .expect("seeding write message");
     }
 
     /// A budget with the default weights and a pinned clock — 2026-07-31T00:00Z.
@@ -4691,7 +4733,7 @@ mod tests {
     fn an_oversized_limit_is_the_stores_error_not_the_since_error() {
         let (_scratch, conn) = seeded();
         let huge = pyint::PyInt::parse("99999999999999999999").expect("parses");
-        let error = find_sessions_in_path(&conn, "/home/dev/alpha", None, &huge, None, &budget(0))
+        let error = find_sessions_in_path(&conn, &alpha_path(""), None, &huge, None, &budget(0))
             .expect_err("the bind overflows");
         assert!(
             ValueError::of(&error).is_none(),
@@ -5079,9 +5121,8 @@ mod tests {
     #[test]
     fn sessions_in_path_matches_ancestor_projects_only() {
         let (_scratch, conn) = seeded();
-        let result =
-            find_sessions_in_path(&conn, "/home/dev/alpha/src", None, 20, None, &budget(0))
-                .expect("query runs");
+        let result = find_sessions_in_path(&conn, &alpha_path("src"), None, 20, None, &budget(0))
+            .expect("query runs");
         let mut ids: Vec<&str> = result
             .sessions
             .iter()
@@ -5115,7 +5156,7 @@ mod tests {
             0.0,
             "no mart row → 0.0"
         );
-        assert_eq!(result.sessions[0].project_path, "/home/dev/alpha");
+        assert_eq!(result.sessions[0].project_path, alpha_path(""));
         assert!(!result.truncated);
     }
 
@@ -5127,7 +5168,7 @@ mod tests {
         // the cost term (0.2 × 1.25/5 = 0.05) by more than a day of recency is
         // worth at this distance, exactly as the reference orders it.
         let (_scratch, conn) = seeded();
-        let result = find_sessions_in_path(&conn, "/home/dev/alpha", None, 20, None, &budget(2000))
+        let result = find_sessions_in_path(&conn, &alpha_path(""), None, 20, None, &budget(2000))
             .expect("query runs");
         let ids: Vec<&str> = result
             .sessions
@@ -5157,26 +5198,20 @@ mod tests {
     #[test]
     fn sessions_in_path_honours_provider_since_and_limit() {
         let (_scratch, conn) = seeded();
-        let filtered = find_sessions_in_path(&conn, "/home/dev/alpha", None, 1, None, &budget(0))
+        let alpha = alpha_path("");
+        let filtered = find_sessions_in_path(&conn, &alpha, None, 1, None, &budget(0))
             .expect("query runs")
             .sessions;
         assert_eq!(filtered.len(), 1);
 
-        let by_provider = find_sessions_in_path(
-            &conn,
-            "/home/dev/alpha",
-            None,
-            20,
-            Some("codex"),
-            &budget(0),
-        )
-        .expect("query runs")
-        .sessions;
+        let by_provider = find_sessions_in_path(&conn, &alpha, None, 20, Some("codex"), &budget(0))
+            .expect("query runs")
+            .sessions;
         assert!(by_provider.is_empty(), "alpha is a claude project");
 
         let since = find_sessions_in_path(
             &conn,
-            "/home/dev/alpha",
+            &alpha,
             Some("2026-01-03T00:00:00+00:00"),
             20,
             None,
@@ -5264,13 +5299,12 @@ mod tests {
         // Findings ledger #1: `content_text` is empty on tool-call turns, so the
         // file an Edit touched cannot be found by searching message content.
         let (_scratch, conn) = seeded();
+        let main = alpha_path("main.py");
         let result =
-            search_past_decisions(&conn, "/home/dev/alpha/main.py", None, None, 20, &budget(0))
-                .expect("query runs");
+            search_past_decisions(&conn, &main, None, None, 20, &budget(0)).expect("query runs");
         assert!(result.sessions.is_empty());
         // …while the tool-arg scan does find it.
-        let touching =
-            find_sessions_touching_file(&conn, "/home/dev/alpha/main.py", 20).expect("query runs");
+        let touching = find_sessions_touching_file(&conn, &main, 20).expect("query runs");
         assert_eq!(touching.len(), 1);
     }
 
@@ -5341,6 +5375,8 @@ mod tests {
     #[test]
     fn the_file_narrowing_intersects_and_never_adds() {
         let (_scratch, conn) = seeded();
+        let reader = alpha_path("reader.py");
+        let main = alpha_path("main.py");
         let unfiltered = find_sessions_where_action_worked(
             &conn,
             "watermark",
@@ -5353,7 +5389,7 @@ mod tests {
             &conn,
             "watermark",
             &ActionWorked {
-                file_path: Some("/home/dev/alpha/reader.py"),
+                file_path: Some(&reader),
                 ..ActionWorked::new(None, None, 20, 0.5)
             },
         )
@@ -5364,7 +5400,7 @@ mod tests {
             &conn,
             "watermark",
             &ActionWorked {
-                file_path: Some("/home/dev/alpha/main.py"),
+                file_path: Some(&main),
                 ..ActionWorked::new(None, None, 20, 0.5)
             },
         )
@@ -5404,25 +5440,21 @@ mod tests {
                 .map(|row| row.session_id)
                 .collect()
         };
+        let main = alpha_path("main.py");
+        let reader = alpha_path("reader.py");
         // main.py is an `Edit` arg in session 1 — write and any see it, read does not.
-        assert_eq!(
-            ids(outcome::Mode::Write, "/home/dev/alpha/main.py").len(),
-            1
-        );
-        assert_eq!(ids(outcome::Mode::Any, "/home/dev/alpha/main.py").len(), 1);
-        assert!(ids(outcome::Mode::Read, "/home/dev/alpha/main.py").is_empty());
+        assert_eq!(ids(outcome::Mode::Write, &main).len(), 1);
+        assert_eq!(ids(outcome::Mode::Any, &main).len(), 1);
+        assert!(ids(outcome::Mode::Read, &main).is_empty());
         // reader.py is a `Write` arg in session 2.
-        assert_eq!(
-            ids(outcome::Mode::Write, "/home/dev/alpha/reader.py").len(),
-            1
-        );
-        assert!(ids(outcome::Mode::Read, "/home/dev/alpha/reader.py").is_empty());
+        assert_eq!(ids(outcome::Mode::Write, &reader).len(), 1);
+        assert!(ids(outcome::Mode::Read, &reader).is_empty());
     }
 
     #[test]
     fn failure_modes_anchor_on_the_last_write_mention() {
         let (_scratch, conn) = seeded();
-        let failures = find_failure_modes_for_file(&conn, "/home/dev/alpha/main.py", None, 20, 0.5)
+        let failures = find_failure_modes_for_file(&conn, &alpha_path("main.py"), None, 20, 0.5)
             .expect("query runs");
         assert_eq!(failures.len(), 1);
         let fields = failures[0].outcome.as_ref().expect("an outcome match");
@@ -5436,9 +5468,9 @@ mod tests {
     #[test]
     fn risk_counts_the_three_slices_and_the_recent_ids() {
         let (_scratch, conn) = seeded();
-        let risk =
-            file_risk_summary(&conn, "/home/dev/alpha/main.py", None, 5).expect("query runs");
-        assert_eq!(risk.path, "/home/dev/alpha/main.py");
+        let main = alpha_path("main.py");
+        let risk = file_risk_summary(&conn, &main, None, 5).expect("query runs");
+        assert_eq!(risk.path, main);
         assert_eq!(risk.total_sessions, 1);
         assert_eq!(risk.failed, 1);
         assert_eq!(risk.reverted, 0);
@@ -5448,7 +5480,7 @@ mod tests {
             ["aaaaaaaa-1111-4111-8111-111111111111"]
         );
 
-        let clean = file_risk_summary(&conn, "/home/dev/alpha/reader.py", None, 5).expect("runs");
+        let clean = file_risk_summary(&conn, &alpha_path("reader.py"), None, 5).expect("runs");
         assert_eq!(clean.worked, 1);
         assert_eq!(clean.failed, 0);
         assert!(clean.recent_session_ids.is_empty());
@@ -5457,8 +5489,8 @@ mod tests {
     #[test]
     fn risk_echoes_the_raw_since_string_not_the_parsed_one() {
         let (_scratch, conn) = seeded();
-        let risk = file_risk_summary(&conn, "/home/dev/alpha/main.py", Some("30d"), 5)
-            .expect("query runs");
+        let risk =
+            file_risk_summary(&conn, &alpha_path("main.py"), Some("30d"), 5).expect("query runs");
         assert_eq!(risk.since.as_deref(), Some("30d"));
     }
 
@@ -5466,11 +5498,11 @@ mod tests {
     fn cwd_scoping_prefers_the_longest_slug_match() {
         let (_scratch, conn) = seeded();
         assert_eq!(
-            detect_cwd_project_slug(&conn, "/home/dev/alpha/src/deep"),
+            detect_cwd_project_slug(&conn, &alpha_path("src/deep")),
             Some("-home-dev-alpha".to_string())
         );
         assert_eq!(
-            detect_cwd_project_slug(&conn, "/home/dev/beta"),
+            detect_cwd_project_slug(&conn, &beta_path("")),
             Some("-home-dev-beta".to_string())
         );
         // The ledgered behavior: a cwd no slug covers scopes to nothing, and the
@@ -5481,16 +5513,14 @@ mod tests {
     #[test]
     fn cwd_scoping_prefers_the_stored_path_when_one_exists() {
         let (_scratch, conn) = seeded();
-        conn.execute(
-            "UPDATE projects SET path = '/mnt/data/alpha' WHERE id = 1",
-            [],
-        )
-        .expect("setting a stored path");
+        let replacement = fixture_path("replacement-alpha");
+        conn.execute("UPDATE projects SET path = ?1 WHERE id = 1", [&replacement])
+            .expect("setting a stored path");
         assert_eq!(
-            detect_cwd_project_slug(&conn, "/mnt/data/alpha/src"),
+            detect_cwd_project_slug(&conn, &format!("{replacement}/src")),
             Some("-home-dev-alpha".to_string())
         );
-        assert_eq!(detect_cwd_project_slug(&conn, "/home/dev/alpha"), None);
+        assert_eq!(detect_cwd_project_slug(&conn, &alpha_path("")), None);
     }
 
     #[test]
@@ -5539,14 +5569,14 @@ mod tests {
         let before: i64 = conn
             .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
             .expect("counting");
-        let _ = find_sessions_in_path(&conn, "/home/dev/alpha", None, 20, None, &budget(2000));
+        let _ = find_sessions_in_path(&conn, &alpha_path(""), None, 20, None, &budget(2000));
         let _ = search_past_decisions(&conn, "watermark", None, None, 20, &budget(2000));
         let _ = find_sessions_where_action_worked(
             &conn,
             "watermark",
             &ActionWorked::new(None, None, 20, 0.5),
         );
-        let _ = file_risk_summary(&conn, "/home/dev/alpha/main.py", None, 5);
+        let _ = file_risk_summary(&conn, &alpha_path("main.py"), None, 5);
         let after: i64 = conn
             .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
             .expect("counting");

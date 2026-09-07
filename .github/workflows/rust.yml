@@ -5,11 +5,16 @@ on:
     branches: [main]
     paths: ['rust/**', '.github/workflows/rust.yml']
   pull_request:
-    paths: ['rust/**']
+    paths: ['rust/**', '.github/workflows/rust.yml']
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: workspace (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -17,8 +22,8 @@ jobs:
         with:
           workspaces: rust
       - name: fmt
-        run: cd rust && cargo fmt --check
+        run: cd rust && cargo fmt --all -- --check
       - name: clippy
-        run: cd rust && cargo clippy --workspace --all-targets -- -D warnings
+        run: cd rust && cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: test
-        run: cd rust && cargo test --workspace --no-fail-fast
+        run: cd rust && cargo test --locked --workspace --all-targets --no-fail-fast
