@@ -1,0 +1,9 @@
+{
+  "schema": "staxtrace.performance-scenario",
+  "scenario": "query_cold",
+  "fixture": {"messages": 1},
+  "samples": 1,
+  "guard": {"metric": "p99_ms", "comparison": "at_most", "limit": 999999.0},
+  "test": {"package": "stax-server", "integration_test": "perf_gates", "test_name": "cold_and_warm_query_distributions"},
+  "resources": {"mode": "edge", "minimum_rss_samples": 2, "minimum_open_file_samples": 2, "child_process_samples": 0}
+}

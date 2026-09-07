@@ -1,0 +1,9 @@
+{
+  "schema": "staxtrace.performance-scenario",
+  "scenario": "duplicate_fixture",
+  "fixture": {"rows": 20},
+  "samples": 4,
+  "guard": {"metric": "p99_ms", "comparison": "at_most", "limit": 200.0},
+  "test": {"package": "stax-server", "integration_test": "perf_extension", "test_name": "duplicate_fixture_distribution"},
+  "resources": {"mode": "continuous", "minimum_rss_samples": 2, "minimum_open_file_samples": 2, "child_process_samples": 0}
+}

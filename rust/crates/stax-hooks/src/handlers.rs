@@ -140,8 +140,11 @@ fn classify(
         }
     };
 
-    match hook_id {
-        "stackunderflow-post-tool-use" => {
+    let event = templates::EVENT_HOOK_IDS
+        .iter()
+        .find_map(|&(event, id)| (id == hook_id).then_some(event))?;
+    match event {
+        "PostToolUse" => {
             // `Err` is the reference raising inside `_tool_call_failed` — the
             // fire is over, no row, no output.
             if !tool_call_failed(payload).ok()? {
@@ -167,7 +170,7 @@ fn classify(
             Some((KIND_FAILURE, stored(meta)))
         }
 
-        "stackunderflow-user-prompt" => {
+        "UserPromptSubmit" => {
             let prompt = payload.get("prompt").and_then(Value::as_str)?;
             let matched = correction_match(prompt)?;
             let meta = vec![
@@ -185,7 +188,7 @@ fn classify(
             Some((KIND_CORRECTION, stored(meta)))
         }
 
-        "stackunderflow-stop" => {
+        "Stop" => {
             let meta = vec![
                 (
                     "hook_event_name".into(),
@@ -204,7 +207,7 @@ fn classify(
             Some((KIND_BOUNDARY, stored(meta)))
         }
 
-        "stackunderflow-pre-compact" => {
+        "PreCompact" => {
             let meta = vec![
                 (
                     "hook_event_name".into(),
@@ -716,7 +719,41 @@ fn resolve_project_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct Scratch {
+        path: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            static SEQ: AtomicU32 = AtomicU32::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock before the epoch")
+                .as_nanos();
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "stax-hook-dispatch-{tag}-{}-{nanos}-{seq}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create hook scratch directory");
+            Self { path }
+        }
+
+        fn store(&self) -> PathBuf {
+            self.path.join("store.db")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     fn env() -> HookEnv {
         HookEnv {
@@ -730,6 +767,15 @@ mod tests {
             recall_timeout: None,
             memory_bin: "stackunderflow".into(),
             proactive: crate::env::ProactiveSettings::default(),
+        }
+    }
+
+    fn scratch_env(scratch: &Scratch, now_micros: i64) -> HookEnv {
+        HookEnv {
+            store_path: scratch.store(),
+            app_dir: scratch.path.clone(),
+            now_micros,
+            ..env()
         }
     }
 
@@ -751,7 +797,7 @@ mod tests {
                 ("stdout", Value::Str("ok".into())),
             ]),
         )]);
-        assert!(classify("stackunderflow-post-tool-use", &payload, false, &env()).is_none());
+        assert!(classify("staxtrace-post-tool-use", &payload, false, &env()).is_none());
     }
 
     #[test]
@@ -876,7 +922,7 @@ mod tests {
             // No `cwd` at all → the key must not appear in the stored metadata.
         ]);
         let (kind, stored) =
-            classify("stackunderflow-post-tool-use", &payload, false, &env()).expect("failure row");
+            classify("staxtrace-post-tool-use", &payload, false, &env()).expect("failure row");
         assert_eq!(kind, KIND_FAILURE);
         assert_eq!(
             pyjson::dumps_default(&stored),
@@ -891,7 +937,7 @@ mod tests {
             ("prompt", Value::Str("secret".into())),
         ]);
         let (_, stored) =
-            classify("stackunderflow-post-tool-use", &payload, true, &env()).expect("failure row");
+            classify("staxtrace-post-tool-use", &payload, true, &env()).expect("failure row");
         assert_eq!(
             pyjson::dumps_default(&stored),
             pyjson::dumps_default(&payload)
@@ -902,7 +948,7 @@ mod tests {
     fn prompt_length_counts_characters() {
         let payload = obj(&[("prompt", Value::Str("no ❤❤❤".into()))]);
         let (kind, stored) =
-            classify("stackunderflow-user-prompt", &payload, false, &env()).expect("correction");
+            classify("staxtrace-user-prompt", &payload, false, &env()).expect("correction");
         assert_eq!(kind, KIND_CORRECTION);
         assert_eq!(
             pyjson::dumps_default(&stored),
@@ -913,8 +959,7 @@ mod tests {
     #[test]
     fn a_boundary_row_carries_unavailable_totals_without_a_store() {
         let payload = obj(&[("session_id", Value::Str("s-1".into()))]);
-        let (kind, stored) =
-            classify("stackunderflow-stop", &payload, false, &env()).expect("boundary");
+        let (kind, stored) = classify("staxtrace-stop", &payload, false, &env()).expect("boundary");
         assert_eq!(kind, KIND_BOUNDARY);
         assert_eq!(
             pyjson::dumps_default(&stored),
@@ -939,6 +984,336 @@ mod tests {
             .stdout,
             ""
         );
+
+        let scratch = Scratch::new("unknown");
+        let fresh = scratch_env(&scratch, 1_785_456_000_000_000);
+        assert_eq!(
+            run("not-an-installed-id", &Value::Object(vec![]), false, &fresh),
+            Fired::default()
+        );
+        assert!(
+            !fresh.store_path.exists(),
+            "an unknown id must not create a fresh store"
+        );
+    }
+
+    #[test]
+    fn a_canonical_capture_write_failure_is_swallowed() {
+        let scratch = Scratch::new("write-failure");
+        let blocker = scratch.path.join("not-a-directory");
+        fs::write(&blocker, "block").expect("create path blocker");
+        let mut env = scratch_env(&scratch, 1_785_456_000_000_000);
+        env.store_path = blocker.join("store.db");
+        assert_eq!(
+            run(
+                "staxtrace-stop",
+                &obj(&[("session_id", Value::Str("blocked".into()))]),
+                false,
+                &env,
+            ),
+            Fired::default()
+        );
+        assert_eq!(
+            fs::read_to_string(blocker).expect("blocker survives"),
+            "block"
+        );
+    }
+
+    #[test]
+    fn a_fresh_home_self_heals_and_stores_canonical_stop_ids() {
+        let scratch = Scratch::new("fresh-stop");
+        let env = scratch_env(&scratch, 1_785_456_000_000_000);
+        assert!(
+            !env.store_path.exists(),
+            "the proof must start without a store"
+        );
+
+        let canonical_payload = obj(&[
+            ("session_id", Value::Str("canonical-session".into())),
+            ("stop_hook_active", Value::Bool(true)),
+            ("cwd", Value::Str("/home/u/proj".into())),
+        ]);
+        assert_eq!(
+            run("staxtrace-stop", &canonical_payload, false, &env),
+            Fired::default()
+        );
+
+        let conn = Connection::open(&env.store_path).expect("open self-healed store");
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(version, 0, "hook self-healing must not claim a migration");
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'captured_events'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("capture table exists");
+        assert_eq!(table_count, 1);
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+                 AND name IN ('idx_captured_events_session', 'idx_captured_events_kind')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("capture indexes exist");
+        assert_eq!(index_count, 2);
+        let canonical: (String, Option<i64>, String, String, String, String) = conn
+            .query_row(
+                "SELECT ts, project_id, session_id, hook_id, event_kind, payload_json \
+                 FROM captured_events",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("canonical boundary row");
+        assert_eq!(
+            canonical,
+            (
+                "2026-07-31T00:00:00+00:00".into(),
+                None,
+                "canonical-session".into(),
+                "staxtrace-stop".into(),
+                KIND_BOUNDARY.into(),
+                r#"{"hook_event_name": "Stop", "stop_hook_active": true, "cwd": "/home/u/proj", "session_totals": {"available": false}}"#.into(),
+            )
+        );
+        drop(conn);
+
+        let legacy_payload = obj(&[("session_id", Value::Str("legacy-session".into()))]);
+        assert_eq!(
+            run("stackunderflow-stop", &legacy_payload, false, &env),
+            Fired::default()
+        );
+        let conn = Connection::open(&env.store_path).expect("reopen self-healed store");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM captured_events", [], |row| row.get(0))
+            .expect("count boundary rows");
+        assert_eq!(count, 2);
+        let legacy: (String, String, String) = conn
+            .query_row(
+                "SELECT hook_id, event_kind, payload_json FROM captured_events \
+                 WHERE session_id = 'legacy-session'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("legacy boundary row");
+        assert_eq!(
+            legacy,
+            (
+                "staxtrace-stop".into(),
+                KIND_BOUNDARY.into(),
+                r#"{"hook_event_name": "Stop", "session_totals": {"available": false}}"#.into(),
+            )
+        );
+    }
+
+    #[test]
+    fn canonical_capture_dispatch_preserves_the_positive_and_negative_matrix() {
+        let scratch = Scratch::new("capture-matrix");
+        let env = scratch_env(&scratch, 1_785_456_000_000_000);
+
+        let successful_tool = obj(&[
+            ("session_id", Value::Str("tool-ok".into())),
+            ("tool_response", obj(&[("exit_code", Value::Int(0))])),
+        ]);
+        let _ = run("staxtrace-post-tool-use", &successful_tool, false, &env);
+        let failed_tool = obj(&[
+            ("session_id", Value::Str("tool-failed".into())),
+            ("tool_name", Value::Str("Bash".into())),
+            (
+                "tool_response",
+                obj(&[
+                    ("exit_code", Value::Int(7)),
+                    ("stderr", Value::Str("boom\nmore".into())),
+                ]),
+            ),
+        ]);
+        let _ = run("staxtrace-post-tool-use", &failed_tool, false, &env);
+        let _ = run(
+            "staxtrace-user-prompt",
+            &obj(&[
+                ("session_id", Value::Str("ordinary".into())),
+                ("prompt", Value::Str("please keep going".into())),
+            ]),
+            false,
+            &env,
+        );
+        let _ = run(
+            "staxtrace-user-prompt",
+            &obj(&[
+                ("session_id", Value::Str("correction".into())),
+                ("prompt", Value::Str("no, undo that".into())),
+            ]),
+            false,
+            &env,
+        );
+        let _ = run(
+            "staxtrace-stop",
+            &obj(&[("session_id", Value::Str("stop".into()))]),
+            false,
+            &env,
+        );
+        let _ = run(
+            "staxtrace-pre-compact",
+            &obj(&[
+                ("session_id", Value::Str("compact".into())),
+                ("trigger", Value::Str("manual".into())),
+            ]),
+            false,
+            &env,
+        );
+
+        let conn = Connection::open(&env.store_path).expect("open capture matrix");
+        let rows = conn
+            .prepare(
+                "SELECT session_id, hook_id, event_kind, payload_json \
+                 FROM captured_events ORDER BY id",
+            )
+            .expect("prepare capture matrix")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .expect("query capture matrix")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect capture matrix");
+        assert_eq!(rows.len(), 4, "the two negative cases must stay no-ops");
+        assert_eq!(
+            rows.iter()
+                .map(|(session, hook, kind, _)| (session.as_str(), hook.as_str(), kind.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("tool-failed", "staxtrace-post-tool-use", KIND_FAILURE),
+                ("correction", "staxtrace-user-prompt", KIND_CORRECTION),
+                ("stop", "staxtrace-stop", KIND_BOUNDARY),
+                ("compact", "staxtrace-pre-compact", KIND_SNAPSHOT),
+            ]
+        );
+        assert!(rows[0].3.contains(r#""error_summary": "boom""#));
+        assert_eq!(
+            rows[3].3,
+            r#"{"hook_event_name": "PreCompact", "trigger": "manual", "session_totals": {"available": false}}"#
+        );
+        drop(conn);
+
+        let content_env = scratch_env(&scratch, 1_785_456_000_000_001);
+        let full_payload = obj(&[
+            ("session_id", Value::Str("content".into())),
+            ("tool_response", obj(&[("exit_code", Value::Int(9))])),
+            ("private_field", Value::Str("opted-in".into())),
+        ]);
+        let _ = run("staxtrace-post-tool-use", &full_payload, true, &content_env);
+        let conn = Connection::open(&content_env.store_path).expect("open content row");
+        let stored: String = conn
+            .query_row(
+                "SELECT payload_json FROM captured_events WHERE session_id = 'content'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("content row");
+        assert_eq!(stored, pyjson::dumps_default(&full_payload));
+    }
+
+    #[test]
+    fn every_installed_id_belongs_to_exactly_one_dispatch_family() {
+        use std::collections::BTreeSet;
+
+        type EventTable = &'static [(&'static str, &'static str)];
+        type FamilyIds = &'static [&'static str];
+        let registries: [(EventTable, FamilyIds); 4] = [
+            (
+                templates::EVENT_HOOK_IDS.as_slice(),
+                templates::HOOK_IDS.as_slice(),
+            ),
+            (
+                templates::INJECT_EVENT_HOOK_IDS.as_slice(),
+                templates::INJECT_HOOK_IDS.as_slice(),
+            ),
+            (
+                templates::RECALL_EVENT_HOOK_IDS.as_slice(),
+                templates::RECALL_HOOK_IDS.as_slice(),
+            ),
+            (
+                templates::NUDGE_EVENT_HOOK_IDS.as_slice(),
+                templates::NUDGE_HOOK_IDS.as_slice(),
+            ),
+        ];
+        let mut installed = Vec::new();
+        let mut unique = BTreeSet::new();
+
+        for (event_table, family_ids) in &registries {
+            let event_ids: Vec<&str> = event_table.iter().map(|(_, id)| *id).collect();
+            assert_eq!(
+                event_ids.as_slice(),
+                *family_ids,
+                "event-table order drifted from its dispatch family"
+            );
+            assert_eq!(
+                event_ids.iter().copied().collect::<BTreeSet<_>>(),
+                family_ids.iter().copied().collect::<BTreeSet<_>>(),
+                "event-table membership drifted from its dispatch family"
+            );
+            for hook_id in event_ids {
+                assert!(
+                    unique.insert(hook_id),
+                    "{hook_id} appears in more than one installed event registry"
+                );
+                installed.push(hook_id);
+            }
+        }
+
+        assert_eq!(
+            installed.as_slice(),
+            templates::ALL_HOOK_IDS.as_slice(),
+            "the global installed registry must exactly concatenate the family registries"
+        );
+        assert_eq!(
+            unique,
+            templates::ALL_HOOK_IDS
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            "the global installed registry set must exactly match the event registries"
+        );
+
+        for hook_id in installed {
+            let bindings: Vec<&(&str, &str)> = registries
+                .iter()
+                .flat_map(|(event_table, _)| event_table.iter())
+                .filter(|(_, id)| *id == hook_id)
+                .collect();
+            assert_eq!(bindings.len(), 1, "{hook_id} must have one family/event");
+            let (event, _) = *bindings[0];
+            assert!(
+                registries
+                    .iter()
+                    .filter(|(_, family_ids)| family_ids.contains(&hook_id))
+                    .count()
+                    == 1,
+                "{hook_id} must belong to exactly one dispatch family"
+            );
+            assert_eq!(
+                templates::hook_id_event(hook_id),
+                Some(event),
+                "{hook_id} maps to a different installed event"
+            );
+        }
     }
 
     #[test]
@@ -977,7 +1352,7 @@ mod tests {
             obj(&[("exit_code", Value::Str("--5".into()))]),
         )]);
         assert_eq!(tool_call_failed(&payload), Err(Aborted));
-        assert!(classify("stackunderflow-post-tool-use", &payload, false, &env()).is_none());
+        assert!(classify("staxtrace-post-tool-use", &payload, false, &env()).is_none());
     }
 
     #[test]

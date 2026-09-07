@@ -46,13 +46,20 @@ use crate::templates;
 
 // ── budgets ─────────────────────────────────────────────────────────────────
 
+/// Look up a canonical injection id without re-running the external legacy-id
+/// normalizer. The event/id table is the installed-hook authority.
+fn injection_event(hook_id: &str) -> Option<&'static str> {
+    templates::INJECT_EVENT_HOOK_IDS
+        .iter()
+        .find_map(|&(event, id)| (id == hook_id).then_some(event))
+}
+
 /// `inject._TOKEN_BUDGET` — SessionStart fires once and can afford a fuller
 /// digest; the per-prompt / per-edit hooks stay lean.
 #[must_use]
 pub fn token_budget(hook_id: &str) -> i64 {
-    match hook_id {
-        "stackunderflow-inject-session-start" => 400,
-        "stackunderflow-inject-user-prompt" | "stackunderflow-inject-pre-tool-use" => 200,
+    match injection_event(hook_id) {
+        Some("SessionStart") => 400,
         // `_clip`'s `.get(hook_id, 200)` — the default for an id with no entry.
         _ => 200,
     }
@@ -83,17 +90,15 @@ const DEFAULT_MIN_OUTCOME_CONFIDENCE: f64 = 0.5;
 /// internal step folds into `""`.
 #[must_use]
 pub fn build_injection(hook_id: &str, payload: &Value, env: &HookEnv) -> String {
-    let Some(event) = templates::hook_id_event(hook_id) else {
+    let Some(event) = injection_event(hook_id) else {
         return String::new();
     };
-    if !templates::INJECT_HOOK_IDS.contains(&hook_id) {
-        return String::new();
-    }
 
-    let text = match hook_id {
-        "stackunderflow-inject-session-start" => session_start_context(payload, env),
-        "stackunderflow-inject-user-prompt" => user_prompt_context(payload, env),
-        "stackunderflow-inject-pre-tool-use" => pre_tool_use_context(payload, env),
+    let budget = token_budget(hook_id);
+    let text = match event {
+        "SessionStart" => session_start_context(payload, env, budget),
+        "UserPromptSubmit" => user_prompt_context(payload, env, budget),
+        "PreToolUse" => pre_tool_use_context(payload, env),
         _ => Ok(String::new()),
     }
     .unwrap_or_default();
@@ -111,10 +116,7 @@ pub fn build_injection(hook_id: &str, payload: &Value, env: &HookEnv) -> String 
     // its mark-seen side effect fires even when the text it produced is
     // dropped by the emptiness check below, which is the reference's
     // behaviour and the reason a message is never announced twice.
-    let text = if matches!(
-        hook_id,
-        "stackunderflow-inject-user-prompt" | "stackunderflow-inject-pre-tool-use"
-    ) {
+    let text = if matches!(event, "UserPromptSubmit" | "PreToolUse") {
         let inbox = stax_core::agent_inbox::render_for_injection(Some(&env.app_dir));
         if inbox.is_empty() {
             text
@@ -162,7 +164,11 @@ fn connect(env: &HookEnv) -> Option<Store> {
 
 // ── SessionStart: project digest ────────────────────────────────────────────
 
-fn session_start_context(payload: &Value, env: &HookEnv) -> anyhow::Result<String> {
+fn session_start_context(
+    payload: &Value,
+    env: &HookEnv,
+    token_budget: i64,
+) -> anyhow::Result<String> {
     let Some(cwd) = payload
         .get("cwd")
         .and_then(Value::as_str)
@@ -179,7 +185,7 @@ fn session_start_context(payload: &Value, env: &HookEnv) -> anyhow::Result<Strin
         None,
         SESSION_START_LIMIT,
         None,
-        &env.budget(token_budget("stackunderflow-inject-session-start")),
+        &env.budget(token_budget),
     )?;
 
     if result.sessions.is_empty() {
@@ -338,7 +344,11 @@ pub fn prompt_to_query(prompt: &str) -> Option<String> {
     best.map(str::to_string)
 }
 
-fn user_prompt_context(payload: &Value, env: &HookEnv) -> anyhow::Result<String> {
+fn user_prompt_context(
+    payload: &Value,
+    env: &HookEnv,
+    token_budget: i64,
+) -> anyhow::Result<String> {
     let Some(prompt) = payload.get("prompt").and_then(Value::as_str) else {
         return Ok(String::new());
     };
@@ -355,7 +365,7 @@ fn user_prompt_context(payload: &Value, env: &HookEnv) -> anyhow::Result<String>
         slug.as_deref(),
         None,
         USER_PROMPT_LIMIT,
-        &env.budget(token_budget("stackunderflow-inject-user-prompt")),
+        &env.budget(token_budget),
     )?;
 
     if result.sessions.is_empty() {
@@ -498,7 +508,41 @@ pub fn clip(text: &str, hook_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct Scratch {
+        path: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            static SEQ: AtomicU32 = AtomicU32::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock before the epoch")
+                .as_nanos();
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "stax-inject-dispatch-{tag}-{}-{nanos}-{seq}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create injection scratch directory");
+            Self { path }
+        }
+
+        fn store(&self) -> PathBuf {
+            self.path.join("store.db")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     fn env() -> HookEnv {
         HookEnv {
@@ -515,12 +559,134 @@ mod tests {
         }
     }
 
+    fn obj(pairs: &[(&str, Value)]) -> Value {
+        Value::Object(
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), value.clone()))
+                .collect(),
+        )
+    }
+
+    fn seeded_env(tag: &str) -> (Scratch, HookEnv) {
+        let scratch = Scratch::new(tag);
+        let project_dir = scratch.path.join("project");
+        fs::create_dir_all(project_dir.join("src")).expect("create seeded project tree");
+        let project_dir = fs::canonicalize(project_dir).expect("resolve seeded project tree");
+        let project_path = project_dir.to_string_lossy().into_owned();
+        let file_path = project_dir
+            .join("src/lib.rs")
+            .to_string_lossy()
+            .into_owned();
+        let env = HookEnv {
+            store_path: scratch.store(),
+            app_dir: scratch.path.clone(),
+            cwd: project_dir,
+            ..env()
+        };
+        let conn = rusqlite::Connection::open(&env.store_path).expect("create injection store");
+        stax_core::schema::apply(&conn).expect("apply production schema");
+        conn.execute(
+            "INSERT INTO projects \
+             (id, provider, slug, path, display_name, first_seen, last_modified) \
+             VALUES (1, 'local', ?, ?, 'project', 0, 0)",
+            rusqlite::params![slugify(&project_path), project_path],
+        )
+        .expect("seed project");
+        conn.execute_batch(
+            r#"
+            INSERT INTO sessions
+              (id, project_id, session_id, first_ts, last_ts, message_count)
+            VALUES
+              (1, 1, 'seeded-session',
+               '2026-07-30T09:00:00+00:00', '2026-07-30T10:00:00+00:00', 3);
+
+            INSERT INTO session_mart
+              (session_id, project_id, provider, first_ts, last_ts, message_count, cost_usd)
+            VALUES
+              ('seeded-session', 1, 'local',
+               '2026-07-30T09:00:00+00:00', '2026-07-30T10:00:00+00:00', 3, 0.25);
+            "#,
+        )
+        .expect("seed session evidence");
+
+        let partition: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' \
+                 AND (name GLOB 'messages_[0-9][0-9][0-9][0-9][0-9][0-9]' \
+                      OR name = 'messages_unknown') \
+                 ORDER BY name LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("production schema must expose a message partition");
+        let suffix = partition
+            .strip_prefix("messages_")
+            .expect("trusted partition prefix");
+        assert!(
+            suffix == "unknown"
+                || (suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_digit())),
+            "reject an untrusted partition identifier"
+        );
+        let insert = format!(
+            "INSERT INTO \"{partition}\" \
+             (id, session_fk, seq, timestamp, role, content_text, tools_json, raw_json) \
+             VALUES (?, 1, ?, ?, ?, ?, ?, '{{}}')"
+        );
+        conn.execute(
+            &insert,
+            rusqlite::params![
+                1_i64,
+                1_i64,
+                "2026-07-30T09:10:00+00:00",
+                "user",
+                "keep canonicalDispatchToken in the selected path",
+                "[]"
+            ],
+        )
+        .expect("seed decision message");
+        let tools_json = pyjson::dumps_default(&Value::Array(vec![obj(&[
+            ("name", Value::Str("Edit".into())),
+            ("input", obj(&[("file_path", Value::Str(file_path))])),
+        ])]));
+        conn.execute(
+            &insert,
+            rusqlite::params![
+                2_i64,
+                2_i64,
+                "2026-07-30T09:20:00+00:00",
+                "assistant",
+                "",
+                tools_json
+            ],
+        )
+        .expect("seed file edit message");
+        conn.execute(
+            &insert,
+            rusqlite::params![
+                3_i64,
+                3_i64,
+                "2026-07-30T09:30:00+00:00",
+                "user",
+                "that broke the build",
+                "[]"
+            ],
+        )
+        .expect("seed failure response");
+        let visible: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .expect("read production messages view");
+        assert_eq!(visible, 3, "the production view must expose seeded rows");
+        drop(conn);
+        (scratch, env)
+    }
+
     #[test]
     fn an_unknown_id_injects_nothing() {
         assert_eq!(build_injection("nope", &Value::Object(vec![]), &env()), "");
         // A capture id is not an injection id, even though it HAS an event.
         assert_eq!(
-            build_injection("stackunderflow-stop", &Value::Object(vec![]), &env()),
+            build_injection("staxtrace-stop", &Value::Object(vec![]), &env()),
             ""
         );
     }
@@ -529,9 +695,188 @@ mod tests {
     fn a_missing_store_injects_nothing_rather_than_failing() {
         let payload = Value::Object(vec![("cwd".into(), Value::Str("/home/u/proj".into()))]);
         assert_eq!(
-            build_injection("stackunderflow-inject-session-start", &payload, &env()),
+            build_injection("staxtrace-inject-session-start", &payload, &env()),
             ""
         );
+    }
+
+    #[test]
+    fn canonical_query_errors_and_malformed_payloads_are_silent() {
+        let scratch = Scratch::new("query-failure");
+        let broken = HookEnv {
+            store_path: scratch.store(),
+            app_dir: scratch.path.clone(),
+            ..env()
+        };
+        drop(
+            rusqlite::Connection::open(&broken.store_path)
+                .expect("create a store without the production schema"),
+        );
+        let payload = obj(&[("cwd", Value::Str("/project".into()))]);
+        assert_eq!(
+            crate::handlers::run("staxtrace-inject-session-start", &payload, false, &broken,)
+                .stdout,
+            ""
+        );
+        assert_eq!(
+            crate::handlers::run(
+                "staxtrace-inject-user-prompt",
+                &Value::Str("malformed".into()),
+                false,
+                &broken,
+            )
+            .stdout,
+            ""
+        );
+    }
+
+    #[test]
+    fn every_canonical_injection_and_legacy_command_reaches_the_same_envelope() {
+        let (_scratch, env) = seeded_env("matrix");
+        let project_path = env.cwd.to_string_lossy().into_owned();
+        let source_dir = env.cwd.join("src").to_string_lossy().into_owned();
+        let file_path = env.cwd.join("src/lib.rs").to_string_lossy().into_owned();
+        let cases = [
+            (
+                "staxtrace-inject-session-start",
+                "stackunderflow-inject-session-start",
+                obj(&[("cwd", Value::Str(source_dir))]),
+                "SessionStart",
+                "prior recorded coding sessions",
+            ),
+            (
+                "staxtrace-inject-user-prompt",
+                "stackunderflow-inject-user-prompt",
+                obj(&[
+                    (
+                        "prompt",
+                        Value::Str("what about canonicalDispatchToken?".into()),
+                    ),
+                    ("cwd", Value::Str(project_path)),
+                ]),
+                "UserPromptSubmit",
+                "canonicalDispatchToken",
+            ),
+            (
+                "staxtrace-inject-pre-tool-use",
+                "stackunderflow-inject-pre-tool-use",
+                obj(&[("tool_input", obj(&[("file_path", Value::Str(file_path))]))]),
+                "PreToolUse",
+                "has gone wrong before",
+            ),
+        ];
+
+        for (canonical_id, legacy_id, payload, event, evidence) in cases {
+            if event == "SessionStart" {
+                let direct = session_start_context(&payload, &env, 400)
+                    .expect("seeded SessionStart query must succeed");
+                assert!(
+                    !direct.is_empty(),
+                    "the seeded SessionStart store must warrant output"
+                );
+            }
+            let canonical = crate::handlers::run(canonical_id, &payload, false, &env).stdout;
+            let legacy = crate::handlers::run(legacy_id, &payload, false, &env).stdout;
+            assert!(!canonical.is_empty(), "{canonical_id} must inject evidence");
+            assert_eq!(legacy, canonical, "legacy input must normalize once");
+            assert!(
+                canonical.contains(&format!(r#""hookEventName": "{event}""#)),
+                "{canonical_id} selected the wrong event envelope: {canonical}"
+            );
+            assert!(
+                canonical.contains(evidence),
+                "{canonical_id} omitted its seeded evidence: {canonical}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_two_canonical_mid_session_hooks_consume_inbox_messages() {
+        let (_scratch, env) = seeded_env("inbox");
+        stax_core::agent_inbox::deliver_local(
+            "fresh coordination note",
+            "peer",
+            "message-1",
+            "2026-08-27T12:00:00+00:00",
+            Some(&env.app_dir),
+        )
+        .expect("seed inbox message");
+        let session_start = crate::handlers::run(
+            "staxtrace-inject-session-start",
+            &obj(&[(
+                "cwd",
+                Value::Str(env.cwd.join("src").to_string_lossy().into_owned()),
+            )]),
+            false,
+            &env,
+        )
+        .stdout;
+        assert!(!session_start.contains("[staxtrace inbox]"));
+        assert_eq!(
+            stax_core::agent_inbox::list_messages(false, Some(&env.app_dir)).len(),
+            1,
+            "SessionStart must leave the inbox message unseen"
+        );
+
+        let prompt_payload = obj(&[
+            (
+                "prompt",
+                Value::Str("what about canonicalDispatchToken?".into()),
+            ),
+            ("cwd", Value::Str(env.cwd.to_string_lossy().into_owned())),
+        ]);
+        let prompt_output =
+            crate::handlers::run("staxtrace-inject-user-prompt", &prompt_payload, false, &env)
+                .stdout;
+        let inbox = prompt_output
+            .find("[staxtrace inbox]")
+            .expect("prompt inbox block");
+        let memory = prompt_output
+            .find("[staxtrace memory]")
+            .expect("prompt memory block");
+        assert!(inbox < memory, "the inbox must remain ahead of memory");
+        assert!(prompt_output.contains("fresh coordination note"));
+        assert!(stax_core::agent_inbox::list_messages(false, Some(&env.app_dir)).is_empty());
+
+        stax_core::agent_inbox::deliver_local(
+            "second coordination note",
+            "peer",
+            "message-2",
+            "2026-08-27T12:01:00+00:00",
+            Some(&env.app_dir),
+        )
+        .expect("seed second inbox message");
+        let pretool_output = crate::handlers::run(
+            "staxtrace-inject-pre-tool-use",
+            &obj(&[(
+                "tool_input",
+                obj(&[(
+                    "file_path",
+                    Value::Str(env.cwd.join("src/lib.rs").to_string_lossy().into_owned()),
+                )]),
+            )]),
+            false,
+            &env,
+        )
+        .stdout;
+        assert!(pretool_output.contains("second coordination note"));
+        let inbox = pretool_output
+            .find("[staxtrace inbox]")
+            .expect("pre-tool inbox block");
+        let memory = pretool_output
+            .find("[staxtrace memory]")
+            .expect("pre-tool memory block");
+        assert!(inbox < memory, "the inbox must remain ahead of memory");
+        assert!(stax_core::agent_inbox::list_messages(false, Some(&env.app_dir)).is_empty());
+    }
+
+    #[test]
+    fn canonical_registry_drives_the_exact_injection_budgets() {
+        assert_eq!(token_budget("staxtrace-inject-session-start"), 400);
+        assert_eq!(token_budget("staxtrace-inject-user-prompt"), 200);
+        assert_eq!(token_budget("staxtrace-inject-pre-tool-use"), 200);
+        assert_eq!(token_budget("staxtrace-stop"), 200);
+        assert_eq!(token_budget("unknown"), 200);
     }
 
     #[test]
@@ -571,11 +916,13 @@ mod tests {
     #[test]
     fn the_clip_is_the_real_bound() {
         let long = "x".repeat(2_000);
-        let clipped = clip(&long, "stackunderflow-inject-session-start");
+        let clipped = clip(&long, "staxtrace-inject-session-start");
         assert_eq!(pystr::len_chars(&clipped), 1_600);
         assert!(clipped.ends_with('…'));
         // The per-prompt budget is a quarter of that.
-        let clipped = clip(&long, "stackunderflow-inject-user-prompt");
+        let clipped = clip(&long, "staxtrace-inject-user-prompt");
+        assert_eq!(pystr::len_chars(&clipped), 800);
+        let clipped = clip(&long, "staxtrace-inject-pre-tool-use");
         assert_eq!(pystr::len_chars(&clipped), 800);
         // An unknown id takes `.get(hook_id, 200)`.
         assert_eq!(pystr::len_chars(&clip(&long, "who?")), 800);
