@@ -127,6 +127,15 @@ fn store(scratch: &Scratch) -> Connection {
         "#
     ))
     .expect("seed");
+    let prefix = queries::paths::resolve_input_path("/home/dev/alpha");
+    conn.execute("UPDATE projects SET path=?1 WHERE id=1", [&prefix])
+        .expect("canonical project path");
+    conn.execute(
+        "UPDATE messages_202601 SET tools_json=replace(tools_json,'/home/dev/alpha',?1),
+         content_text=replace(content_text,'/home/dev/alpha',?1)",
+        [&prefix],
+    )
+    .expect("canonical fixture paths");
     conn
 }
 
@@ -150,6 +159,10 @@ fn index(scratch: &Scratch, rows: &[(&str, &str, &str, &str)]) -> LexicalIndex {
     )
     .expect("index schema");
     for (session_id, project, content, timestamp) in rows {
+        let content = content.replace(
+            "/home/dev/alpha",
+            &queries::paths::resolve_input_path("/home/dev/alpha"),
+        );
         conn.execute(
             "INSERT INTO messages (session_id, project, role, content, timestamp) \
              VALUES (?, ?, 'user', ?, ?)",

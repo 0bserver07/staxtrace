@@ -33,3 +33,16 @@ stax-memory = { path = "crates/stax-memory" }
 [profile.release]
 lto = true
 codegen-units = 1
+
+# RP-139: avoid SQLx's unused SQLite driver's native-library conflict with
+# staxtrace's rusqlite. These dependency-only copies keep upstream source and
+# versions intact; scripts/test_rigwright_durable_work_vendor.py verifies them.
+[patch.crates-io]
+sqlx = { path = "../vendor/sqlx-postgres-only/sqlx-0.8.6" }
+sqlx-macros-core = { path = "../vendor/sqlx-postgres-only/sqlx-macros-core-0.8.6" }
+
+# Avoid the macOS 27 LINKEDIT alignment failure in stripped proc-macro dylibs.
+# Only this feature's macro is affected; default staxtrace artifacts are unchanged.
+[profile.dev.package.sqlx-macros]
+debug = "line-tables-only"
+strip = "none"

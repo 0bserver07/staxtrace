@@ -108,6 +108,16 @@ INSERT INTO session_mart VALUES ('sess-one',1,'claude',NULL,'2026-07-01T00:00:00
 ",
     )
     .expect("rows");
+    let prefix = stax_core::queries::paths::resolve_input_path("/tmp/demo");
+    conn.execute("UPDATE projects SET path=?1", [&prefix])
+        .unwrap();
+    conn.execute("UPDATE session_mart SET cwd=?1", [&prefix])
+        .unwrap();
+    conn.execute(
+        "UPDATE messages_202607 SET tools_json=replace(tools_json,'/tmp/demo',?1)",
+        [&prefix],
+    )
+    .unwrap();
     drop(conn);
     (scratch, path)
 }
@@ -119,7 +129,7 @@ const NOW: f64 = 1_785_888_000.0;
 fn options() -> Options {
     Options {
         now_epoch: NOW,
-        cwd: "/tmp/demo".to_string(),
+        cwd: stax_core::queries::paths::resolve_input_path("/tmp/demo"),
         ..Options::default()
     }
 }
@@ -256,9 +266,15 @@ fn file_reports_risk_and_tags_each_row_with_its_kind() {
     );
     let value = envelope(&outcome);
     assert_eq!(value["command"], "file");
-    assert_eq!(value["query"]["path"], "/tmp/demo/app.py");
+    assert_eq!(
+        value["query"]["path"],
+        stax_core::queries::paths::resolve_input_path("/tmp/demo/app.py")
+    );
     let risk = &value["risk"];
-    assert_eq!(risk["path"], "/tmp/demo/app.py");
+    assert_eq!(
+        risk["path"],
+        stax_core::queries::paths::resolve_input_path("/tmp/demo/app.py")
+    );
     assert_eq!(risk["total_sessions"], 1);
     // The keys and their order are the contract (`RiskSummary::to_dict`); the
     // classifier's own counts are stax-core's business, and this fixture's
@@ -308,7 +324,10 @@ fn a_relative_file_path_resolves_against_the_declared_cwd() {
             options: options(),
         },
     );
-    assert_eq!(envelope(&outcome)["risk"]["path"], "/tmp/demo/app.py");
+    assert_eq!(
+        envelope(&outcome)["risk"]["path"],
+        stax_core::queries::paths::resolve_input_path("/tmp/demo/app.py")
+    );
 }
 
 #[test]

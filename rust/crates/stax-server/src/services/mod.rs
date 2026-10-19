@@ -151,3 +151,6 @@ pub use stax_reports::{
 // visible at the call site: the two process-local job slots are PARAMETERS,
 // because a CLI process has no slots to read.
 pub use stax_reports::etl_status;
+
+#[cfg(feature = "rigwright-durable-work")]
+pub mod durable_backfill;

@@ -102,6 +102,19 @@ tower-http = { version = "0.6.7", features = ["fs"] }
 # Default features (`std`) are the ones the graph already unified on.
 futures-core = "0.3.33"
 
+# RP-139: the original binaries and dependencies remain the default build.
+# This candidate is vendored byte-for-byte and has no other Rigwright dependency.
+deskroost-jobs = { version = "=0.1.0", path = "../../../vendor/rigwright-durable-work/deskroost-jobs-0.1.0", optional = true }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"], optional = true }
+
+[features]
+rigwright-durable-work = ["dep:deskroost-jobs", "dep:sqlx", "tokio/sync"]
+
+[[bin]]
+name = "stax-durable-backfill"
+path = "src/bin/stax-durable-backfill.rs"
+required-features = ["rigwright-durable-work"]
+
 [dev-dependencies]
 tokio = { version = "1.52.3", features = [
     "rt-multi-thread",

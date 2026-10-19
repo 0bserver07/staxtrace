@@ -408,10 +408,27 @@ mod tests {
             let (mut socket, _) = listener.accept().await.expect("accept");
             let mut seen = Vec::new();
             let mut chunk = [0_u8; 4096];
-            // One read is enough: the whole request head arrives in one segment
-            // on loopback, and the tests send no entity larger than that.
-            let read = socket.read(&mut chunk).await.expect("read");
-            seen.extend_from_slice(&chunk[..read]);
+            // TCP can split the head and body even on loopback. Read the
+            // complete Content-Length-framed request before replying.
+            loop {
+                let read = socket.read(&mut chunk).await.expect("read");
+                assert!(read > 0, "request ended before its complete frame");
+                seen.extend_from_slice(&chunk[..read]);
+                if let Some(head_end) = seen.windows(4).position(|v| v == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&seen[..head_end]);
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().expect("content length"))
+                        })
+                        .unwrap_or(0);
+                    if seen.len() >= head_end + 4 + length {
+                        break;
+                    }
+                }
+            }
             socket.write_all(canned).await.expect("write");
             socket.flush().await.expect("flush");
             seen

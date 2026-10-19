@@ -486,6 +486,9 @@ mod tests {
             ));
             std::fs::remove_dir_all(&dir).ok();
             std::fs::create_dir_all(&dir).unwrap();
+            // Keep project-scope discovery inside this disposable fixture even
+            // when TMPDIR itself is beneath another repository.
+            std::fs::create_dir(dir.join(".git")).unwrap();
             Self(dir)
         }
         fn env(&self) -> installer::Env {

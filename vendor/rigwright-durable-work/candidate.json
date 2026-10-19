@@ -1,0 +1,21 @@
+{
+  "archive_sha256": "c780ff030ee306da7fd8bc674aa543cbec01851076ce4991f6d3d5510c538e1c",
+  "files": {
+    "Cargo.toml": "5adea9d38fe7ac4358c2e135a59a438dc88f97a77d626514d2135445f41c73e7",
+    "README.md": "6e75c3f2c1ac15bd270492dc8c917a27ed61a07de46bf74960d1569938fcfe93",
+    "schema.sql": "2cddb423989a5549aa105e1d61ee8c494329022411c30fec86e8a67dad124d2b",
+    "src/consumer.rs": "9692addbf670511b957c0d168ee42184872027aa3a1980f970b24db6d8f0120d",
+    "src/dead_letters.rs": "e5e54f8105196bf83869664ea9eebb35291730a0e6979c48c34f3dd0ff020b74",
+    "src/health.rs": "8fee002e5c87b0cb0b66b5fa382af035b5f74552387ae6e49294f29b3ce978b3",
+    "src/health_tests.rs": "d4ac432628ff9b5089d2a150d9c7a8d8376a4ab1dc99d788857014b921d997c3",
+    "src/lib.rs": "02ec4f1021be3d138950d8e82898cf5c426d69aef36ca4207091758ce398007c",
+    "src/outbound.rs": "ba55e32afb12a77a8d3d647e28ea763990b35c16f952fa7b678a8d82e4d3672e",
+    "src/runtime.rs": "30153f1a6ecdcdf33cac4670f5b8c86b5b910d8949766c21548dce011c0e1f17"
+  },
+  "interface": "durable-work-core.v1",
+  "package": "deskroost-jobs",
+  "real_projects_qualified": false,
+  "release_status": "unreleased-candidate",
+  "schema": "rigwright.primitive-candidate.v1",
+  "version": "0.1.0"
+}

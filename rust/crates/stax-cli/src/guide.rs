@@ -646,6 +646,9 @@ mod tests {
             ));
             std::fs::remove_dir_all(&dir).ok();
             std::fs::create_dir_all(&dir).unwrap();
+            // Scratch may live beneath a checkout (e.g. an adopter build
+            // directory). Never let project-scope discovery escape the fixture.
+            std::fs::create_dir(dir.join(".git")).unwrap();
             Self(dir)
         }
         fn path(&self) -> &Path {

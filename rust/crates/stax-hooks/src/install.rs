@@ -755,6 +755,8 @@ mod tests {
             ));
             std::fs::remove_dir_all(&dir).ok();
             std::fs::create_dir_all(&dir).unwrap();
+            // Project discovery must not walk into a checkout enclosing TMPDIR.
+            std::fs::write(dir.join(".git"), "test fixture boundary\n").unwrap();
             Self(dir)
         }
         fn env(&self) -> Env {

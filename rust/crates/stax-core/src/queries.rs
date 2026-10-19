@@ -4243,6 +4243,21 @@ mod tests {
             "#,
         )
         .expect("seeding messages");
+
+        // `/home` can be a symlink/firmlink on macOS. Store the same canonical
+        // spelling the query path resolver uses, rather than Linux-only paths.
+        for (id, path) in [(1, "/home/dev/alpha"), (2, "/home/dev/beta")] {
+            conn.execute(
+                "UPDATE projects SET path=?1 WHERE id=?2",
+                rusqlite::params![paths::resolve_input_path(path), id],
+            )
+            .expect("canonical fixture project path");
+        }
+        conn.execute(
+            "UPDATE messages_202601 SET tools_json=replace(tools_json,'/home/dev/alpha',?1)",
+            [paths::resolve_input_path("/home/dev/alpha")],
+        )
+        .expect("canonical fixture tool paths");
     }
 
     /// A budget with the default weights and a pinned clock — 2026-07-31T00:00Z.
@@ -5115,7 +5130,10 @@ mod tests {
             0.0,
             "no mart row → 0.0"
         );
-        assert_eq!(result.sessions[0].project_path, "/home/dev/alpha");
+        assert_eq!(
+            result.sessions[0].project_path,
+            paths::resolve_input_path("/home/dev/alpha")
+        );
         assert!(!result.truncated);
     }
 
@@ -5438,7 +5456,10 @@ mod tests {
         let (_scratch, conn) = seeded();
         let risk =
             file_risk_summary(&conn, "/home/dev/alpha/main.py", None, 5).expect("query runs");
-        assert_eq!(risk.path, "/home/dev/alpha/main.py");
+        assert_eq!(
+            risk.path,
+            paths::resolve_input_path("/home/dev/alpha/main.py")
+        );
         assert_eq!(risk.total_sessions, 1);
         assert_eq!(risk.failed, 1);
         assert_eq!(risk.reverted, 0);
@@ -5465,6 +5486,7 @@ mod tests {
     #[test]
     fn cwd_scoping_prefers_the_longest_slug_match() {
         let (_scratch, conn) = seeded();
+        conn.execute("UPDATE projects SET path=NULL", []).unwrap();
         assert_eq!(
             detect_cwd_project_slug(&conn, "/home/dev/alpha/src/deep"),
             Some("-home-dev-alpha".to_string())

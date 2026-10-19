@@ -1,0 +1,16 @@
+[package]
+edition = "2024"
+name = "deskroost-jobs"
+publish = false
+readme = "README.md"
+rust-version = "1.88"
+version = "0.1.0"
+
+[dependencies]
+chrono = { features = ["serde"], version = "0.4" }
+reqwest = { default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate", "multipart"], version = "0.12" }
+serde_json = { features = ["preserve_order", "raw_value", "float_roundtrip"], version = "1" }
+sqlx = { default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "migrate", "macros"], version = "0.8" }
+uuid = { features = ["v4", "serde"], version = "1" }
+
+[workspace]
